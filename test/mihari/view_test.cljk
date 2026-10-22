@@ -1,0 +1,51 @@
+(ns mihari.view-test
+  "view は SSR（handler 無し）とブラウザ（Reagent）の両方で使う。
+  SSR の hiccup に fn が混ざらないこと、React に渡す :style が map であること、
+  データ入りでも描けることを見る。"
+  (:require ["fs" :as fs]
+            [cljs.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
+            [kotoba.lang.text :as text]
+            [mihari.core :as core]
+            [mihari.ingest :as ingest]
+            [mihari.view :as view]))
+
+(defn- attrs [form]
+  (let [acc (atom [])]
+    (walk/postwalk (fn [x] (when (and (vector? x) (keyword? (first x)) (map? (second x)))
+                             (swap! acc conj (second x)))
+                     x)
+                   form)
+    @acc))
+
+(defn- texts [form]
+  (let [acc (atom [])]
+    (walk/postwalk (fn [x] (when (string? x) (swap! acc conj x)) x) form)
+    (text/join " " @acc)))
+
+(def populated
+  (let [db (core/add-events core/empty-db
+                            (:events (ingest/ingest (fs/readFileSync "test/fixtures/events.json" "utf8"))))]
+    (assoc view/initial-model :db db :selected (first (keys (:issues db))))))
+
+(deftest ssr-has-no-handlers
+  (doseq [m [view/initial-model populated]]
+    (let [as (attrs (view/main m {}))]
+      (is (seq as))
+      (is (not-any? (fn [a] (some fn? (vals a))) as) "handler が無ければ fn は出ない")
+      (is (every? (fn [a] (or (nil? (:style a)) (map? (:style a)))) as) ":style は map だけ"))))
+
+(deftest browser-handlers-are-wired
+  (let [h (into {} (map (fn [k] [k (fn [& _] k)]))
+                [:on-import-text :on-import-project :on-import-file :on-import :on-sample
+                 :on-filter :on-select :on-status :on-export :on-clear-ask :on-clear-cancel :on-clear])
+        as (attrs (view/main populated h))]
+    (is (some :on-click as))
+    (is (some :on-change as))))
+
+(deftest content
+  (is (text/includes? (texts (view/main view/initial-model {})) "まだ何もありません"))
+  (let [t (texts (view/main populated {}))]
+    (is (text/includes? t "RangeError: bad index"))
+    (is (text/includes? t "MIHARI-1"))
+    (is (text/includes? t "Sentry は Functional Software, Inc. の商標です"))))

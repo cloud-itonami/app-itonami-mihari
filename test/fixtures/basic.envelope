@@ -1,0 +1,10 @@
+{"event_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "dsn": "https://publickey@o0.ingest.example/42", "sent_at": "2025-10-22T03:00:01Z"}
+{"type": "event", "length": 730}
+{"event_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "timestamp": 1761100000.5, "level": "error", "platform": "javascript", "release": "web@1.2.0", "environment": "production", "exception": {"values": [{"type": "TypeError", "value": "x is undefined — 見張り", "stacktrace": {"frames": [{"filename": "app/vendor.js", "function": "run", "in_app": false}, {"module": "app/cart", "function": "total", "in_app": true}]}}]}, "user": {"id": "u-1", "ip_address": "203.0.113.7", "email": "alice@example.com"}, "request": {"url": "https://shop.example/cart", "headers": {"Cookie": "sid=secret", "User-Agent": "x"}, "cookies": "sid=secret", "env": {"REMOTE_ADDR": "203.0.113.7"}}, "tags": {"browser": "Firefox", "client_ip": "203.0.113.7"}}
+{"type": "attachment", "length": 29, "filename": "a.txt"}
+hello attachment
+with newline
+{"type": "event"}
+{"event_id": "b1b2c3d4e5f60718293a4b5c6d7e8f91", "timestamp": "2025-10-22T03:00:00Z", "level": "warning", "platform": "python", "message": {"formatted": "disk almost full"}, "user": {"email": "bob@example.com"}}
+{"type": "session"}
+{"sid": "s1", "status": "ok"}

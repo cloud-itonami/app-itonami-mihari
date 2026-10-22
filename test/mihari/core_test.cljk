@@ -1,0 +1,75 @@
+(ns mihari.core-test
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            [mihari.core :as core]))
+
+(defn- ev [id ts level grouping & {:as more}]
+  (merge {:event-id id :timestamp ts :level level :grouping grouping :title grouping
+          :project "web"}
+         more))
+
+(deftest grouping-and-counts
+  (let [db (core/add-events core/empty-db
+                            [(ev "1" "2025-10-22T01:00:00Z" "error" "TypeError: x" :user-key "id:a")
+                             (ev "2" "2025-10-22T02:00:00Z" "error" "TypeError: x" :user-key "id:b")
+                             (ev "3" "2025-10-22T03:00:00Z" "warning" "disk")])
+        [disk tx] (core/issue-list db {})]
+    (testing "同じ grouping は 1 issue"
+      (is (= 2 (count (:issues db))))
+      (is (= 2 (:count tx)))
+      (is (= 2 (core/user-count tx))))
+    (testing "lastSeen の新しい順"
+      (is (= "disk" (:title disk))))
+    (testing "shortId は project ごとの連番"
+      (is (= #{"WEB-1" "WEB-2"} (set (map :short-id (vals (:issues db)))))))
+    (testing "firstSeen / lastSeen"
+      (is (= "2025-10-22T01:00:00Z" (:first-seen tx)))
+      (is (= "2025-10-22T02:00:00Z" (:last-seen tx))))
+    (testing "同じ event-id を 2 回入れても変わらない（冪等）"
+      (is (= db (core/add-event db (ev "1" "2025-10-22T01:00:00Z" "error" "TypeError: x")))))))
+
+(deftest level-and-priority-follow-the-guest
+  (let [db (core/add-events core/empty-db
+                            [(ev "1" "t1" "warning" "g")
+                             (ev "2" "t2" "fatal" "g")])
+        issue (first (vals (:issues db)))]
+    (is (= "fatal" (:level issue)) "level は max-level")
+    (is (= "high" (:priority issue)) "fatal は high")
+    (let [db2 (core/add-events core/empty-db (map #(ev (str %) (str "t" %) "error" "e" :user-key (str "id:" %)) (range 10)))]
+      (is (= "high" (:priority (first (vals (:issues db2))))) "error で user 10 人は high"))))
+
+(deftest status-transitions-and-regression
+  (let [db (core/add-event core/empty-db (ev "1" "t1" "error" "g"))
+        iid (first (keys (:issues db)))
+        resolved (core/set-status db iid :resolve)
+        regressed (core/add-event resolved (ev "2" "t2" "error" "g"))
+        ignored (core/set-status db iid :ignore)
+        still-ignored (core/add-event ignored (ev "3" "t3" "error" "g"))]
+    (is (= "resolved" (get-in resolved [:issues iid :status])))
+    (is (= "unresolved" (get-in regressed [:issues iid :status])) "resolved に event → unresolved")
+    (is (true? (get-in regressed [:issues iid :regressed?])))
+    (is (= "ignored" (get-in still-ignored [:issues iid :status])) "ignored は event で起きない")
+    (is (false? (get-in (core/set-status regressed iid :resolve) [:issues iid :regressed?])))
+    (is (= db (core/set-status db "no-such-issue" :resolve)))
+    (is (= db (core/set-status db iid :bogus)) "不正な action は変えない")))
+
+(deftest filters
+  (let [db (core/add-events core/empty-db
+                            [(ev "1" "t1" "info" "hello info")
+                             (ev "2" "t2" "error" "Boom" :project "api")])
+        iid (:id (first (core/issue-list db {:query "boom"})))]
+    (is (= ["Boom"] (map :title (core/issue-list db {:query "BOOM"}))))
+    (is (= ["Boom"] (map :title (core/issue-list db {:min-level "warning"}))))
+    (is (= ["hello info"] (map :title (core/issue-list db {:project "web"}))))
+    (is (= [] (core/issue-list (core/set-status db iid :resolve) {:status "unresolved" :project "api"})))
+    (is (= ["api" "web"] (core/projects db)))))
+
+(deftest dehydrate-roundtrip
+  (let [db (core/add-events core/empty-db
+                            [(ev "1" "t1" "error" "g" :user-key "id:a")
+                             (ev "2" "t2" "error" "g" :user-key "id:b")])
+        ;; ブラウザは localStorage に pr-str で書き、clojure.edn で読む（site/app.cljk）。
+        via-edn (edn/read-string (pr-str (core/dehydrate db)))]
+    (is (= db (core/hydrate via-edn)))
+    (is (= core/empty-db (core/hydrate {:version 99})) "知らない version は空にする")
+    (is (= core/empty-db (core/hydrate "garbage")))))

@@ -1,0 +1,4 @@
+{:schema "etzhayyim.repository/v1"
+ :name "app-itonami-mihari"
+ :kind :app
+ :canonical-metadata :edn}

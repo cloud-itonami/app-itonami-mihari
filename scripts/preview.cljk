@@ -1,0 +1,41 @@
+;; site/site.edn の宣言どおりに、ローカルで確かめるための公開物を out/preview/ に組む。
+;;
+;; 本番の生成器（network-awai/cloud-itonami の scripts）と同じ契約をなぞる:
+;; vendor → vendor/、external と sources → :to、(mihari.page/document opts) → index.html。
+;; 違うのは cloud-itonami 共通クロームを被せないことだけ。
+;;
+;; Run（repo ルートから。KOTOBA_LANG は kotoba-lang の checkout、既定 ../../kotoba-lang）:
+;;   K=${KOTOBA_LANG:-../../kotoba-lang}
+;;   kbb --backend sci --classpath "src:site:$K/html/src:$K/css/src:$K/jp-go-digital-design-system/src:$K/text/src" scripts/preview.cljk
+;;   （out/preview/ を静的サーバで開く。file:// では scittle が src を読めない）
+(ns preview
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            [clojure.edn :as edn]
+            [mihari.page :as page]))
+
+(def kotoba-lang (or (aget js/process.env "KOTOBA_LANG") "../../kotoba-lang"))
+(def out "out/preview")
+(def site (edn/read-string (fs/readFileSync "site/site.edn" "utf8")))
+
+(defn- copy! [from to]
+  (when-not (fs/existsSync from) (throw (js/Error. (str "missing source: " from))))
+  (fs/mkdirSync (path/dirname to) #js {:recursive true})
+  (fs/copyFileSync from to))
+
+(fs/rmSync out #js {:recursive true :force true})
+(doseq [f (:vendor site)] (copy! (str "site/vendor/" f) (str out "/vendor/" f)))
+(doseq [{:keys [repo from to]} (:external site)]
+  (copy! (str kotoba-lang "/" (last (.split repo "/")) "/" from) (str out "/" to)))
+(doseq [{:keys [from to]} (:sources site)] (copy! from (str out "/" to)))
+
+(def dds-css
+  (fs/readFileSync (str kotoba-lang "/jp-go-digital-design-system/resources/jp_go_dds/dds.css") "utf8"))
+
+(fs/writeFileSync (str out "/index.html")
+                  (str (page/document {:css dds-css
+                                       :vendor-scripts (mapv #(str "vendor/" %) (:vendor site))
+                                       :scittle-scripts (into (mapv :to (:external site))
+                                                              (map :to (:sources site)))})
+                       "\n"))
+(println (str "wrote " out "/index.html"))

@@ -1,0 +1,25 @@
+{:itonami.blueprint/id "app-itonami-mihari"
+ :itonami.blueprint/name "mihari — Sentry 互換のエラー見張り（ブラウザ内完結）"
+ :itonami.blueprint/domain :software/error-tracking
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:data-sovereignty :self-hosting :developer-privacy]
+ :itonami.blueprint/robotics false
+ :itonami.blueprint/required-technologies [:wasm-guest :browser-local-state]
+ :itonami.blueprint/status :public-oss
+ ;; 判断コア（guest）・取り込み・グルーピング・書き出し・UI はある。分散状態
+ ;; （ADR 0005 の mon / ito / nuno）と aiueos の grant 配線は無い —— docs/aiueos-dapp.md。
+ :itonami.blueprint/maturity :core-only
+ :itonami.blueprint/org "app"
+ ;; :itonami.blueprint/endpoint は書かない。静的配信の道具で、呼べる actor ではない
+ ;; （書くと fleet catalog が callable と数える）。
+ :itonami.blueprint/compat {:target "Sentry"
+                            :scope :data-format
+                            :network false
+                            :note "本家 API へは接続しない（kotoba-client-runtime ブローカー未着地）"}
+ :itonami.blueprint/implementation {:language :kotoba
+                                    :target :wasm32-browser-kotoba-v1
+                                    :guest "aiueos/mihari_core.cljk"
+                                    :ui :scittle-re-frame-reagent
+                                    :capabilities []}
+ :itonami.blueprint/privacy
+ "取り込み時に IP アドレス・request header・cookie・email を捨てる。データは利用者のブラウザの localStorage にだけ置き、送信しない。"}

@@ -1,0 +1,107 @@
+(ns mihari.ingest-test
+  (:require ["fs" :as fs]
+            [cljs.test :refer [deftest is testing]]
+            [kotoba.lang.text :as text]
+            [mihari.core :as core]
+            [mihari.export :as export]
+            [mihari.ingest :as ingest]))
+
+(defn- fixture [f] (fs/readFileSync (str "test/fixtures/" f) "utf8"))
+
+(deftest envelope-items-and-skips
+  (let [{:keys [events skipped format error]} (ingest/ingest (fixture "basic.envelope"))]
+    (is (= :envelope format))
+    (is (nil? error))
+    (testing "event 2 件（length 付き・改行区切り）、attachment と session は数えて捨てる"
+      (is (= 2 (count events)))
+      (is (= {"attachment" 1 "session" 1} skipped)))
+    (testing "length は UTF-8 のバイト数 — 多バイト文字を含む payload を正しく切る"
+      (is (= "TypeError: x is undefined — 見張り" (:title (first events)))))
+    (testing "project は DSN の末尾"
+      (is (= #{"42"} (set (map :project events)))))
+    (testing "culprit は最後の in_app frame"
+      (is (= "app/cart in total" (:culprit (first events)))))
+    (testing "timestamp（epoch 秒）は ISO 8601 に"
+      (is (= "2025-10-22T02:26:40.500Z" (:timestamp (first events)))))
+    (testing "message オブジェクトの formatted"
+      (is (= "disk almost full" (:title (second events))))
+      (is (= "warning" (:level (second events)))))))
+
+(deftest privacy-rule-drops-ip-headers-cookies-email
+  (let [{:keys [events]} (ingest/ingest (fixture "basic.envelope"))
+        [e1 e2] events
+        raw1 (pr-str (:raw e1))]
+    (is (not (text/includes? raw1 "203.0.113.7")) "IP は残らない")
+    (is (not (text/includes? raw1 "alice@example.com")) "email は残らない")
+    (is (not (text/includes? raw1 "sid=secret")) "cookie / header は残らない")
+    (is (nil? (get-in e1 [:raw "request" "headers"])))
+    (is (= "https://shop.example/cart" (get-in e1 [:raw "request" "url"])) "URL は残す")
+    (is (= {"browser" "Firefox"} (get-in e1 [:raw "tags"])) "IP の tag だけ落とす")
+    (is (= "id:u-1" (:user-key e1)))
+    (testing "email だけの利用者は fingerprint を id にして数える"
+      (is (text/starts-with? (:user-key e2) "id:email#"))
+      (is (not (text/includes? (pr-str (:raw e2)) "bob@example.com"))))))
+
+(deftest plain-json-and-grouping
+  (let [{:keys [events format]} (ingest/ingest (fixture "events.json"))
+        db (core/add-events core/empty-db events)
+        issues (core/issue-list db {})]
+    (is (= :event-json format))
+    (is (= 4 (count events)))
+    (testing "同じ例外は 1 issue、fingerprint 配列は message が違っても 1 issue"
+      (is (= 2 (count issues)))
+      (is (= #{2} (set (map :count issues)))))
+    (testing "RangeError は fatal を含むので level fatal / priority high"
+      (let [re (first (filter #(= "RangeError" (get-in % [:metadata :type])) issues))]
+        (is (= "fatal" (:level re)))
+        (is (= "high" (:priority re)))
+        (is (= 2 (core/user-count re)))))))
+
+(deftest sentry-api-event-shape
+  (let [{:keys [events]} (ingest/ingest (fixture "api-events.json") {:project "api"})
+        e (first events)]
+    (is (= "d0000000000000000000000000000001" (:event-id e)))
+    (is (= "2025-10-21T09:00:00Z" (:timestamp e)))
+    (is (= "error" (:level e)) "level は tags から")
+    (is (= "api@3" (:release e)))
+    (is (= "api" (:project e)))
+    (is (not (text/includes? (pr-str (:raw e)) "198.51.100.2")) "user.ip の tag と ip_address を落とす")))
+
+(deftest empty-exception-value
+  (let [e (first (:events (ingest/ingest "{\"event_id\":\"e1\",\"level\":\"fatal\",\"exception\":{\"values\":[{\"type\":\"MemoryError\",\"value\":\"\"}]}}")))]
+    (is (= "MemoryError" (:title e)) "空の value で末尾に「: 」を付けない")
+    (is (= "MemoryError" (:grouping e)))))
+
+(deftest broken-input
+  (is (= :empty (:format (ingest/ingest "  "))))
+  (is (= :bad-envelope-header (:error (ingest/ingest "not json\n{}"))))
+  (let [r (ingest/ingest "{\"dsn\":\"https://k@h/1\"}\n{\"type\":\"event\"}\nnot-json\n")]
+    (is (= {"unparseable" 1} (:skipped r)))))
+
+(deftest export-shapes-and-envelope-roundtrip
+  (let [{:keys [events]} (ingest/ingest (fixture "basic.envelope"))
+        db (core/add-events core/empty-db events)
+        issues (export/issues-json db)
+        iid (get (first issues) "id")
+        env (export/envelope db "2025-10-22T04:00:00Z")
+        again (core/add-events core/empty-db (:events (ingest/ingest env)))]
+    (testing "Sentry の issue 一覧と同じキー。count は文字列"
+      (is (every? #(contains? (first issues) %)
+                  ["id" "shortId" "title" "culprit" "level" "status" "substatus" "priority"
+                   "count" "userCount" "firstSeen" "lastSeen" "project"]))
+      (is (string? (get (first issues) "count"))))
+    (testing "events は eventID / groupID / dateCreated / tags[{key value}]"
+      (let [e (first (export/events-json db iid))]
+        (is (= iid (get e "groupID")))
+        (is (some #(= "level" (get % "key")) (get e "tags")))))
+    (testing "書き出した envelope を取り込み直すと同じ issue になる"
+      (is (= (into {} (map (fn [[k v]] [k (dissoc v :users)])) (:issues db))
+             (into {} (map (fn [[k v]] [k (dissoc v :users)])) (:issues again))))
+      (is (= (map core/user-count (vals (:issues db)))
+             (map core/user-count (vals (:issues again))))))
+    (testing "書き出しにも IP・email・cookie は出ない"
+      (is (not (text/includes? env "203.0.113.7")))
+      (is (not (text/includes? env "alice@example.com")))
+      (is (not (text/includes? env "sid=secret"))))
+    (testing "同じ db にもう一度入れても変わらない（event-id で冪等）"
+      (is (= db (core/add-events db (:events (ingest/ingest env))))))))

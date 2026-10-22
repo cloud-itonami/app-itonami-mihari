@@ -1,0 +1,27 @@
+;; site/vendor/ の出所。どれも npm の公開 tarball から取り出したファイルを、
+;; 手を加えずに置いてある（同一オリジンで配るため。CDN は叩かない）。
+;;
+;; 確かめ方: `npm pack <package>@<version>` の integrity が :tarball-integrity と
+;; 一致し、tarball 内の :path のファイルの sha256 が :sha256 と一致すること。
+;; 取り出し: 2026-10-22（Linear JUN-286）。
+{:format :mihari.vendor-provenance/v1
+ :packages
+ [{:package "scittle" :version "0.8.33" :license "EPL-1.0" :license-file "LICENSE.scittle"
+   :tarball "https://registry.npmjs.org/scittle/-/scittle-0.8.33.tgz"
+   :tarball-integrity "sha512-XeED9aRtVi0uHStoYn8hBO/dYEMfY7W4BIZkuj1J6MSxeGslfHVlar/hhCkYvA7y1X3ISRg/XqmFoz6pEYUUSQ=="
+   :files [{:file "scittle.js" :path "package/dist/scittle.js"
+            :sha256 "e04a33ff90947057772f42e683314e9c9f8671ebb922398208b4ad1c76991373"}
+           {:file "scittle.reagent.js" :path "package/dist/scittle.reagent.js"
+            :sha256 "67b764d914f6348c5a6486b94cc9614dcc004812c998835bc35b64ef22ce6536"}
+           {:file "scittle.re-frame.js" :path "package/dist/scittle.re-frame.js"
+            :sha256 "efa6c33bca35620f5630c0f3cec44b39bfd7ed408140229ce87e2fe8499eaac6"}]}
+  {:package "react" :version "18.3.1" :license "MIT" :license-file "LICENSE.react"
+   :tarball "https://registry.npmjs.org/react/-/react-18.3.1.tgz"
+   :tarball-integrity "sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ=="
+   :files [{:file "react.production.min.js" :path "package/umd/react.production.min.js"
+            :sha256 "d949f1c3687aedadcedac85261865f29b17cd273997e7f6b2bfc53b2f9d4c4dd"}]}
+  {:package "react-dom" :version "18.3.1" :license "MIT" :license-file "LICENSE.react"
+   :tarball "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz"
+   :tarball-integrity "sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw=="
+   :files [{:file "react-dom.production.min.js" :path "package/umd/react-dom.production.min.js"
+            :sha256 "35f4f974f4b2bcd44da73963347f8952e341f83909e4498227d4e26b98f66f0d"}]}]}

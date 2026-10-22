@@ -1,0 +1,18 @@
+(ns run-tests
+  "kbb 実行のテスト runner（npm test から呼ばれる。kaikei と同じ形）。
+
+  ブラウザで動く .cljk（mihari.core / ingest / export / view）は scittle と
+  同じ cljs 系の評価器（kbb = SCI on node）で回す。guest は amu test、wasm 産物は
+  test/guest_parity.mjs が別に見る。"
+  (:require [cljs.test :refer [run-tests]]
+            [mihari.parity-test]
+            [mihari.core-test]
+            [mihari.ingest-test]
+            [mihari.view-test]))
+
+(let [{:keys [fail error]} (run-tests 'mihari.parity-test
+                                      'mihari.core-test
+                                      'mihari.ingest-test
+                                      'mihari.view-test)]
+  (when (pos? (+ fail error))
+    (set! (.-exitCode js/process) 1)))

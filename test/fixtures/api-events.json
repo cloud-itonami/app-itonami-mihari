@@ -1,0 +1,29 @@
+[
+ {
+  "id": "d0000000000000000000000000000001",
+  "eventID": "d0000000000000000000000000000001",
+  "groupID": "999",
+  "title": "ValueError: nope",
+  "message": "",
+  "platform": "python",
+  "dateCreated": "2025-10-21T09:00:00Z",
+  "tags": [
+   {
+    "key": "level",
+    "value": "error"
+   },
+   {
+    "key": "release",
+    "value": "api@3"
+   },
+   {
+    "key": "user.ip",
+    "value": "198.51.100.2"
+   }
+  ],
+  "user": {
+   "id": "7",
+   "ip_address": "198.51.100.2"
+  }
+ }
+]

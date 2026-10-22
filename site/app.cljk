@@ -1,0 +1,183 @@
+;; mihari のブラウザ側。scittle が読む（生成器が app.cljs として配る）。
+;;
+;; Re-frame が状態・event・subscription・effect を持ち、Reagent が描く
+;; （cloud-itonami ADR-0052）。画面は mihari.view/main —— SSR と同じ関数。
+;; innerHTML も手書きの addEventListener も使わない。
+;;
+;; 外に触るのは effect だけ:
+;;   :mihari/persist   localStorage（キー itonami.mihari.v1）へ書く
+;;   :mihari/forget    localStorage から消す
+;;   :mihari/read-file FileReader でローカルのファイルを読む
+;;   :mihari/download  Blob を作って保存させる
+;; どれもネットワークを使わない。fetch も XHR も無い。localStorage の読み書きは
+;; try/catch で囲み、使えない環境（プライベートウィンドウ等）でも動く。
+(ns mihari.app
+  (:require [clojure.edn :as edn]
+            [re-frame.core :as rf]
+            [reagent.dom :as rdom]
+            [mihari.core :as core]
+            [mihari.export :as export]
+            [mihari.ingest :as ingest]
+            [mihari.view :as view]))
+
+(def storage-key "itonami.mihari.v1")
+
+;; ───────── coeffect / effect ─────────
+
+(rf/reg-cofx
+ :mihari/stored-db
+ (fn [cofx _]
+   (assoc cofx :stored-db
+          (try (some-> (.getItem js/localStorage storage-key) edn/read-string core/hydrate)
+               (catch :default _ nil)))))
+
+(rf/reg-cofx
+ :mihari/now
+ (fn [cofx _] (assoc cofx :now (.toISOString (js/Date.)))))
+
+(rf/reg-fx
+ :mihari/persist
+ (fn [db]
+   (try (.setItem js/localStorage storage-key (pr-str (core/dehydrate db)))
+        (catch :default _ nil))))
+
+(rf/reg-fx
+ :mihari/forget
+ (fn [_]
+   (try (.removeItem js/localStorage storage-key) (catch :default _ nil))))
+
+(rf/reg-fx
+ :mihari/read-file
+ (fn [file]
+   (let [reader (js/FileReader.)]
+     (set! (.-onload reader) (fn [_] (rf/dispatch [:import/file-loaded (.-name file) (.-result reader)])))
+     (set! (.-onerror reader) (fn [_] (rf/dispatch [:import/failed (str (.-name file) " を読めませんでした")])))
+     (.readAsText reader file))))
+
+(rf/reg-fx
+ :mihari/download
+ (fn [{:keys [filename mime text]}]
+   (let [blob (js/Blob. #js [text] #js {:type mime})
+         url (js/URL.createObjectURL blob)
+         a (.createElement js/document "a")]
+     (set! (.-href a) url)
+     (set! (.-download a) filename)
+     (.click a)
+     (js/setTimeout #(js/URL.revokeObjectURL url) 1000))))
+
+;; ───────── サンプル（合成データ。実在の人・組織ではない） ─────────
+
+(def sample
+  (str "[{\"event_id\":\"5a0000000000000000000000000000a1\",\"timestamp\":\"2025-10-22T01:00:00Z\","
+       "\"level\":\"error\",\"platform\":\"javascript\",\"release\":\"shop@1.4.0\",\"environment\":\"production\","
+       "\"exception\":{\"values\":[{\"type\":\"TypeError\",\"value\":\"Cannot read properties of undefined (reading 'price')\","
+       "\"stacktrace\":{\"frames\":[{\"filename\":\"vendor.js\",\"function\":\"run\",\"in_app\":false},"
+       "{\"module\":\"shop/cart\",\"function\":\"total\",\"in_app\":true}]}}]},\"user\":{\"id\":\"u-1\"}},"
+       "{\"event_id\":\"5a0000000000000000000000000000a2\",\"timestamp\":\"2025-10-22T01:05:00Z\","
+       "\"level\":\"error\",\"platform\":\"javascript\",\"release\":\"shop@1.4.1\",\"environment\":\"production\","
+       "\"exception\":{\"values\":[{\"type\":\"TypeError\",\"value\":\"Cannot read properties of undefined (reading 'price')\","
+       "\"stacktrace\":{\"frames\":[{\"module\":\"shop/cart\",\"function\":\"total\",\"in_app\":true}]}}]},\"user\":{\"id\":\"u-2\"}},"
+       "{\"event_id\":\"5a0000000000000000000000000000a3\",\"timestamp\":\"2025-10-22T01:10:00Z\","
+       "\"level\":\"warning\",\"platform\":\"python\",\"message\":\"payment provider slow (2.4s)\","
+       "\"fingerprint\":[\"payment-slow\"]},"
+       "{\"event_id\":\"5a0000000000000000000000000000a4\",\"timestamp\":\"2025-10-22T01:20:00Z\","
+       "\"level\":\"fatal\",\"platform\":\"python\",\"exception\":{\"values\":[{\"type\":\"MemoryError\",\"value\":\"\"}]}}]"))
+
+;; ───────── event ─────────
+
+(defn- with-db
+  "db を差し替え、永続化 effect を付ける。"
+  [model db]
+  {:db (assoc model :db db) :mihari/persist db})
+
+(rf/reg-event-fx
+ :app/init
+ [(rf/inject-cofx :mihari/stored-db)]
+ (fn [{:keys [stored-db]} _]
+   {:db (assoc view/initial-model :db (or stored-db core/empty-db))}))
+
+(rf/reg-event-db :import/text (fn [m [_ s]] (assoc-in m [:import :text] s)))
+(rf/reg-event-db :import/project (fn [m [_ s]] (assoc-in m [:import :project] s)))
+(rf/reg-event-db :import/failed (fn [m [_ msg]] (assoc m :import (assoc (:import m) :error msg :report nil))))
+
+(rf/reg-event-fx
+ :import/run
+ (fn [{m :db} [_ text]]
+   (let [text (or text (get-in m [:import :text]))
+         project (not-empty (get-in m [:import :project]))
+         {:keys [events skipped format error]} (ingest/ingest text {:project project})
+         before (:db m)
+         after (core/add-events before events)
+         added (- (count (:event-ids after)) (count (:event-ids before)))]
+     (if (and error (empty? events))
+       {:db (assoc m :import (assoc (:import m) :error (str "読めませんでした（" (name error) "）。envelope か event JSON を貼り付けてください。")
+                                    :report nil))}
+       (merge (with-db m after)
+              {:db (-> m
+                       (assoc :db after)
+                       (assoc :import (assoc (:import m) :text "" :error nil
+                                             :report {:added added
+                                                      :duplicates (- (count events) added)
+                                                      :skipped skipped
+                                                      :format format}))
+                       (assoc-in [:filters :status] "unresolved"))})))))
+
+(rf/reg-event-fx :import/file (fn [_ [_ file]] {:mihari/read-file file}))
+(rf/reg-event-fx :import/file-loaded (fn [_ [_ _name text]] {:dispatch [:import/run text]}))
+(rf/reg-event-fx :import/sample (fn [_ _] {:dispatch [:import/run sample]}))
+
+(rf/reg-event-db :filter/set (fn [m [_ k v]] (assoc-in m [:filters k] v)))
+(rf/reg-event-db :issue/select (fn [m [_ iid]] (assoc m :selected iid)))
+
+(rf/reg-event-fx
+ :issue/status
+ (fn [{m :db} [_ iid action]]
+   (with-db m (core/set-status (:db m) iid action))))
+
+(rf/reg-event-fx
+ :export/run
+ [(rf/inject-cofx :mihari/now)]
+ (fn [{m :db now :now} [_ kind]]
+   (let [db (:db m)]
+     (case kind
+       :issues {:mihari/download {:filename "mihari-issues.json" :mime "application/json"
+                                  :text (export/pretty-json (export/issues-json db (assoc (:filters m) :status "all")))}}
+       :envelope {:mihari/download {:filename "mihari-events.envelope" :mime "application/x-sentry-envelope"
+                                    :text (export/envelope db now)}}
+       :events (when-let [iid (:selected m)]
+                 {:mihari/download {:filename (str "mihari-" (get-in db [:issues iid :short-id]) "-events.json")
+                                    :mime "application/json"
+                                    :text (export/pretty-json (export/events-json db iid))}})
+       nil))))
+
+(rf/reg-event-db :clear/ask (fn [m _] (assoc m :confirm-clear? true)))
+(rf/reg-event-db :clear/cancel (fn [m _] (assoc m :confirm-clear? false)))
+(rf/reg-event-fx
+ :clear/run
+ (fn [{m :db} _]
+   {:db (assoc view/initial-model :import (assoc (:import view/initial-model) :report nil))
+    :mihari/forget true}))
+
+;; ───────── subscription と描画 ─────────
+
+(rf/reg-sub :model (fn [m _] m))
+
+(def handlers
+  {:on-import-text #(rf/dispatch [:import/text %])
+   :on-import-project #(rf/dispatch [:import/project %])
+   :on-import-file #(rf/dispatch [:import/file %])
+   :on-import #(rf/dispatch [:import/run nil])
+   :on-sample #(rf/dispatch [:import/sample])
+   :on-filter (fn [k v] (rf/dispatch [:filter/set k v]))
+   :on-select #(rf/dispatch [:issue/select %])
+   :on-status (fn [iid action] (rf/dispatch [:issue/status iid action]))
+   :on-export #(rf/dispatch [:export/run %])
+   :on-clear-ask #(rf/dispatch [:clear/ask])
+   :on-clear-cancel #(rf/dispatch [:clear/cancel])
+   :on-clear #(rf/dispatch [:clear/run])})
+
+(defn root []
+  (view/main @(rf/subscribe [:model]) handlers))
+
+(rf/dispatch-sync [:app/init])
+(rdom/render [root] (.getElementById js/document "app"))

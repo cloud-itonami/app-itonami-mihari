@@ -1,0 +1,245 @@
+(ns mihari.core
+  "mihari の adapter — guest（aiueos/mihari_core.cljk, ns `mihari.guest`）と
+  **同名・同引数順・同結果**の関数と、その上の純粋な issue ストア。
+
+  guest は i64 しか扱わないので、文字列・keyword との橋渡し（`codes`、
+  `level->code` …）と、map を受ける便利 API（`add-event`、`set-status`、
+  `issue-list` …）はここに置く。parity の表は test/fixtures/parity.edn で、
+  test/mihari/parity_test.cljk がこの ns を、amu test が guest を、
+  test/guest_parity.mjs が wasm 産物を、同じ表で照合する。
+
+  ブラウザでは scittle がこのファイルをそのまま評価する（.cljs として配る）。
+  使うのは clojure.core と kotoba.lang.text だけ。
+
+  互換の範囲: Sentry の**データ形式**（level / status / priority の語彙、
+  issue・event の形）。priority の決め方やグルーピングは mihari の規則で、
+  Sentry 本家の内部アルゴリズムの再現ではない。"
+  (:require [kotoba.lang.text :as text]))
+
+;; ───────── 符号（guest と共有） ─────────
+
+(def levels ["debug" "info" "warning" "error" "fatal"])
+(def statuses ["unresolved" "resolved" "ignored"])
+(def priorities ["low" "medium" "high"])
+(def actions {:unresolve 0 :resolve 1 :ignore 2 :event 3})
+
+(defn- index-of [v x]
+  (or (first (keep-indexed (fn [i y] (when (= x y) i)) v)) -1))
+
+(defn level->code
+  "Sentry の level 文字列 → 0..4。`warn` / `critical` / `log` も受ける
+  （SDK によって出てくる別名）。知らない値は -1。"
+  [level]
+  (let [l (text/lower (str (or level "")))]
+    (case l
+      "warn" 2
+      "critical" 4
+      "log" 1
+      (index-of levels l))))
+
+(defn code->level [c] (get levels c))
+(defn status->code [s] (index-of statuses (str s)))
+(defn code->status [c] (get statuses c))
+(defn code->priority [c] (get priorities c))
+
+;; ───────── guest と同じ判定（parity の対象） ─────────
+
+(defn- rem* [a m] (- a (* m (quot a m))))
+
+(defn- floor-mod [a m]
+  (let [r (rem* a m)]
+    (if (< r 0) (+ r m) r)))
+
+(defn fingerprint
+  "h = (h*31 + c) mod 2147483647、初期値 7。codes は UTF-16 code unit。
+  h < 2^31 なので途中の値は 2^36 未満で、JS の double でも正確。"
+  [codes]
+  (reduce (fn [h c] (rem* (+ (* h 31) c) 2147483647)) 7 codes))
+
+(defn- valid-status? [s] (and (integer? s) (<= 0 s 2)))
+(defn- valid-action? [a] (and (integer? a) (<= 0 a 3)))
+(defn- valid-level? [l] (and (integer? l) (<= 0 l 4)))
+
+(defn next-status [status action]
+  (if (and (valid-status? status) (valid-action? action))
+    (if (= action 3)
+      (if (= status 1) 0 status)
+      action)
+    -1))
+
+(defn regression? [status action]
+  (if (and (= status 1) (= action 3)) 1 0))
+
+(defn priority
+  "mihari の規則: fatal → high。error → user-count ≥ 10 か event-count ≥ 100 で
+  high、それ以外 medium。warning → user-count ≥ 10 で medium、それ以外 low。
+  info / debug → low。不正入力は -1。"
+  [level event-count user-count]
+  (if (and (valid-level? level) (>= event-count 0) (>= user-count 0))
+    (cond
+      (= level 4) 2
+      (= level 3) (if (or (>= user-count 10) (>= event-count 100)) 2 1)
+      (= level 2) (if (>= user-count 10) 1 0)
+      :else 0)
+    -1))
+
+(defn level-at-least? [level floor-level]
+  (if (and (valid-level? level) (valid-level? floor-level))
+    (if (>= level floor-level) 1 0)
+    0))
+
+(defn max-level [a b]
+  (if (and (valid-level? a) (valid-level? b))
+    (if (>= a b) a b)
+    -1))
+
+(defn sampled? [hash rate-ppm]
+  (let [rate (max 0 (min 1000000 rate-ppm))]
+    (if (< (floor-mod hash 1000000) rate) 1 0)))
+
+;; ───────── 文字列の橋 ─────────
+
+(defn codes
+  "文字列 → UTF-16 code unit のベクトル（guest の fingerprint に渡す形）。"
+  [s]
+  (let [s (str s)]
+    (mapv (fn [i] #?(:clj (int (.charAt ^String s (int i)))
+                     :cljs (.charCodeAt s i)))
+          (range (count s)))))
+
+(defn fingerprint-str [s] (fingerprint (codes s)))
+
+;; ───────── issue ストア（純粋な値） ─────────
+;;
+;; db = {:issues {issue-id issue} :event-ids #{…} :events {issue-id [event …]}
+;;       :next-short {project n}}
+;; issue-id は (project + "\n" + grouping 文字列) の fingerprint を 10 進文字列に
+;; したもの。同じ取り込みを 2 回しても event-id で重複を落とす（冪等）。
+
+(def empty-db {:issues {} :event-ids #{} :events {} :next-short {}})
+
+(defn issue-id [project grouping]
+  (str (fingerprint-str (str project "\n" grouping))))
+
+(defn- short-id [project n]
+  (str (text/upper (str project)) "-" n))
+
+(defn- later [a b] (if (and a b) (if (pos? (compare a b)) a b) (or a b)))
+(defn- earlier [a b] (if (and a b) (if (neg? (compare a b)) a b) (or a b)))
+
+(defn- refresh-priority [issue]
+  (assoc issue :priority
+         (code->priority (priority (level->code (:level issue))
+                                   (:count issue)
+                                   (count (:users issue))))))
+
+(defn add-event
+  "正規化済み event（mihari.ingest/normalize-event の戻り）を db に足す。
+  既知の event-id は無視する。resolved の issue に届いたら guest の
+  next-status / regression? どおり unresolved に戻し :regressed? を立てる。"
+  [db ev]
+  (if (contains? (:event-ids db) (:event-id ev))
+    db
+    (let [project (or (:project ev) "mihari")
+          iid (issue-id project (:grouping ev))
+          existing (get-in db [:issues iid])
+          lvl (level->code (:level ev))
+          db (update db :event-ids conj (:event-id ev))
+          db (update-in db [:events iid] (fnil conj []) ev)]
+      (if existing
+        (let [st (status->code (:status existing))
+              st' (next-status st (:event actions))
+              merged (-> existing
+                         (update :count inc)
+                         (update :users (fn [u] (cond-> (or u #{}) (:user-key ev) (conj (:user-key ev)))))
+                         (update :first-seen earlier (:timestamp ev))
+                         (update :last-seen later (:timestamp ev))
+                         (assoc :level (code->level (max-level (level->code (:level existing))
+                                                               (if (neg? lvl) 3 lvl))))
+                         (assoc :status (code->status st'))
+                         (update :release-last (fn [r] (or (:release ev) r)))
+                         (cond-> (= 1 (regression? st (:event actions))) (assoc :regressed? true))
+                         refresh-priority)]
+          (assoc-in db [:issues iid] merged))
+        (let [n (inc (get-in db [:next-short project] 0))
+              issue (refresh-priority
+                     {:id iid
+                      :short-id (short-id project n)
+                      :project project
+                      :title (:title ev)
+                      :culprit (:culprit ev)
+                      :type (if (:exception-type ev) "error" "default")
+                      :metadata {:type (:exception-type ev) :value (:exception-value ev)}
+                      :level (code->level (if (neg? lvl) 3 lvl))
+                      :status "unresolved"
+                      :count 1
+                      :users (if (:user-key ev) #{(:user-key ev)} #{})
+                      :first-seen (:timestamp ev)
+                      :last-seen (:timestamp ev)
+                      :release-first (:release ev)
+                      :release-last (:release ev)
+                      :platform (:platform ev)
+                      :regressed? false})]
+          (-> db
+              (assoc-in [:next-short project] n)
+              (assoc-in [:issues iid] issue)))))))
+
+(defn add-events [db evs] (reduce add-event db evs))
+
+(defn set-status
+  "action は :resolve / :ignore / :unresolve。guest の next-status が -1 を
+  返す組み合わせは db を変えない。手で状態を動かしたら :regressed? は下ろす。"
+  [db iid action]
+  (if-let [issue (get-in db [:issues iid])]
+    (let [st' (next-status (status->code (:status issue)) (get actions action -1))]
+      (if (neg? st')
+        db
+        (assoc-in db [:issues iid] (assoc issue :status (code->status st') :regressed? false))))
+    db))
+
+(defn user-count [issue] (count (:users issue)))
+
+(defn projects [db] (->> (vals (:issues db)) (map :project) distinct sort vec))
+
+(defn issue-list
+  "フィルタして lastSeen の新しい順。filters:
+  :project / :status（文字列、\"all\" で全部） / :min-level（文字列） / :query（部分一致）。"
+  [db {:keys [project status min-level query]}]
+  (let [q (some-> query str text/trim text/lower)
+        min-code (if (seq min-level) (level->code min-level) 0)]
+    (->> (vals (:issues db))
+         (filter (fn [i] (or (empty? project) (= project "all") (= project (:project i)))))
+         (filter (fn [i] (or (empty? status) (= status "all") (= status (:status i)))))
+         (filter (fn [i] (= 1 (level-at-least? (level->code (:level i)) (max 0 min-code)))))
+         (filter (fn [i] (or (empty? q)
+                             (some #(text/includes? (text/lower (str %)) q)
+                                   [(:title i) (:culprit i) (:short-id i)]))))
+         (sort-by (fn [i] [(or (:last-seen i) "") (:short-id i)]))
+         reverse
+         vec)))
+
+(defn issue-events [db iid]
+  (->> (get-in db [:events iid]) (sort-by :timestamp) reverse vec))
+
+;; ───────── 永続化の形 ─────────
+;; ブラウザは localStorage に (pr-str (dehydrate db)) を書き、clojure.edn で読む。
+;; set を sort 済みベクトルにするのは、同じ db から同じ文字列が出るようにするため。
+
+(defn dehydrate
+  "db → EDN に書ける値（set を sort 済みベクトルにする）。"
+  [db]
+  {:version 1
+   :issues (into {} (map (fn [[k v]] [k (update v :users (comp vec sort))])) (:issues db))
+   :event-ids (vec (sort (:event-ids db)))
+   :events (:events db)
+   :next-short (:next-short db)})
+
+(defn hydrate
+  "dehydrate の逆。壊れた値や version 違いは empty-db にする（落とさない）。"
+  [m]
+  (if (and (map? m) (= 1 (:version m)))
+    {:issues (into {} (map (fn [[k v]] [(name k) (update v :users set)])) (:issues m))
+     :event-ids (set (:event-ids m))
+     :events (into {} (map (fn [[k v]] [(name k) (vec v)])) (:events m))
+     :next-short (into {} (map (fn [[k v]] [(name k) v])) (:next-short m))}
+    empty-db))

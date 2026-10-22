@@ -1,0 +1,56 @@
+[
+ {
+  "event_id": "c0000000000000000000000000000001",
+  "timestamp": "2025-10-22T01:00:00Z",
+  "level": "error",
+  "platform": "node",
+  "exception": {
+   "values": [
+    {
+     "type": "RangeError",
+     "value": "bad index"
+    }
+   ]
+  },
+  "user": {
+   "id": "u-9"
+  }
+ },
+ {
+  "event_id": "c0000000000000000000000000000002",
+  "timestamp": "2025-10-22T02:00:00Z",
+  "level": "fatal",
+  "platform": "node",
+  "exception": {
+   "values": [
+    {
+     "type": "RangeError",
+     "value": "bad index"
+    }
+   ]
+  },
+  "user": {
+   "username": "carol"
+  }
+ },
+ {
+  "event_id": "c0000000000000000000000000000003",
+  "timestamp": "2025-10-22T02:30:00Z",
+  "level": "error",
+  "platform": "node",
+  "fingerprint": [
+   "payment-timeout"
+  ],
+  "message": "timeout calling provider A"
+ },
+ {
+  "event_id": "c0000000000000000000000000000004",
+  "timestamp": "2025-10-22T02:40:00Z",
+  "level": "error",
+  "platform": "node",
+  "fingerprint": [
+   "payment-timeout"
+  ],
+  "message": "timeout calling provider B"
+ }
+]
