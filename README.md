@@ -22,6 +22,7 @@ Sentry の envelope／event JSON を取り込み、issue にまとめ、トリ�
 | 書き出し | `src/mihari/export.cljk` — issue 一覧・events を Sentry API と同じキーで、envelope は取り込み直せる形で | **実装済み・実測**（kbb、ブラウザ） |
 | 画面 | `src/mihari/view.cljk`（純 hiccup）+ `site/app.cljk`（Re-frame/Reagent、scittle） | **実測**: ローカル配信で取り込み → トリアージ → regression → 再読込で永続 → 書き出し → 消去 |
 | 公開物の宣言 | `site/site.edn`、`site/mihari/page.cljk`、`site/vendor/`（+ `PROVENANCE.edn`） | 宣言済み。app.itonami.cloud への公開は cloud-itonami 側の作業 |
+| agent 統合（MCP） | `bin/mihari-mcp`（stdio）+ `src/mihari/mcp.cljk` — tool `mihari_ingest_events` / `mihari_decide` | **実装済み・実測**: stdio テスト（agent と同じ 3 行・cwd `/`・最小 env）、kotoba-lang/itonami-agent の MCP クライアントで discover / call |
 | 分散状態 | ADR 0005 の `mon` / `ito` / `nuno` | **未実装**（設計のみ。docs/aiueos-dapp.md） |
 | 本家 Sentry API 直結 | — | **未実装・ブロック中**（`kotoba-client-runtime.js` が無い） |
 
@@ -85,16 +86,46 @@ Sentry の envelope／event JSON を取り込み、issue にまとめ、トリ�
 
 データは利用者のブラウザの `localStorage`（キー `itonami.mihari.v1`）にだけ置く。画面の「すべて消去」で消える。fetch も XHR も使わない。
 
+## itonami agent から使う（MCP）
+
+`bin/mihari-mcp` は stdio の MCP サーバで、itonami agent（kotoba-lang/itonami-agent）や Hermes が profile の `config.yaml` の `mcp_servers` から起動する。
+
+```yaml
+mcp_servers:
+  mihari:
+    command: kbb
+    args: ["/abs/path/to/cloud-itonami/app-itonami-mihari/bin/mihari-mcp"]
+```
+
+- `cwd` は要らない。kbb はこのファイルの位置から `nbb.edn` を見つけ、`kotoba-lang/text` を pin（`bc551a3`）どおり gitlibs から解決する。
+  - 初回だけ依存の取得が走る。そのメッセージは stderr に出て、stdout は JSON-RPC だけ。
+- agent からは `mcp__mihari__<tool>` という名前で見える。
+
+| tool | 入力 | 返すもの |
+|---|---|---|
+| `mihari_ingest_events` | `text`（envelope／event JSON／API `/events/` 応答、5 MiB まで）、`project?`、`include_events?` | Sentry API の issue 形の `issues`、`events_count`、`skipped`（種類ごとの数）、`format`、`warnings`。`include_events` で issue ごとの events |
+| `mihari_decide` | `level`、`count?`、`user_count?`、`status?` + `action?`（2 つは対で） | `priority`。`status` と `action` を渡したときは `next_status` と `regression` |
+
+しないこと:
+- 送信・保存はしない。tool は渡されたテキストだけから結果を作り、呼び出しをまたいで何も覚えない。
+- 本家 Sentry の API には接続しない。
+- 取り込み時のプライバシー規則（上記）はブラウザ版と同じ `mihari.ingest/scrub` がかける。
+
+入力不正（未知の引数、型、enum、5 MiB 超、空、読めないテキスト）は、JSON-RPC の error ではなく `isError: true` の結果で返す。`{"error": "<名前付きの理由>"}` の形。
+
+判定はブラウザと同じ adapter（`mihari.core`）で、wasm guest は読み込まない。guest と同じ結果になることは parity 表（amu test・wasm parity・kbb）で担保している。itonami agent の peer run では MCP が無効なので、この tool はローカル run でだけ使える。
+
 ## 動かし方
 
 west レイアウト（`<root>/cloud-itonami/app-itonami-mihari` と `<root>/kotoba-lang/*`）を前提にする。
 
 ```sh
-npm test            # kbb: parity 表 + adapter + 取り込み/書き出し + view（18 tests）
+npm test            # kbb: parity 表 + adapter + 取り込み/書き出し + view + MCP（27 tests、うち stdio は子プロセス）
 npm run test:guest  # amu test: guest の test-* を jvm-kir / js / wasm で
 npm run test:wasm   # 公開する .wasm を amu の typed ホストで読み、parity 表を全行
 npm run build:guest # amu compile → aiueos/mihari_core.wasm + sidecar
 npm run preview     # site/site.edn どおりに out/preview/ を組む（静的サーバで開く）
+npm run mcp         # stdio MCP サーバ（stdin に JSON-RPC を流す）
 ```
 
 ## ライセンス

@@ -1,0 +1,207 @@
+(ns mihari.mcp
+  "mihari の MCP tool 面 — itonami agent（kotoba-lang/itonami-agent）が profile の
+  `config.yaml` の `mcp_servers` から stdio で呼ぶ（Linear JUN-297）。
+
+  ここにあるのは JSON-RPC の要求 1 件 → 応答 1 件の純関数だけで、stdin/stdout の
+  ループは bin/mihari-mcp が持つ。判定はブラウザと同じ adapter（mihari.core /
+  ingest / export）をそのまま呼ぶ —— 書き直すと 2 実装になり、片方だけ直された
+  瞬間に嘘になる。wasm guest は読まない。guest との一致は test/fixtures/parity.edn
+  の表（amu test・wasm parity・kbb の 3 経路）で担保している。
+
+  **pure**: ネットワークも、ファイルの書き込みも、状態の保存もしない。tool は
+  渡されたテキストだけから結果を作り、呼び出しをまたいで何も覚えない。取り込み時の
+  プライバシー規則（IP・request header・cookie・email を捨てる）はブラウザ版と同じ
+  `mihari.ingest/scrub` が適用する。
+
+  tool の入力不正は JSON-RPC の error ではなく `isError: true` の結果で返す
+  （名前付きの理由を text の `{\"error\": …}` に入れる）。agent はそれを tool の
+  失敗として model に見せる。"
+  (:require [kotoba.lang.text :as text]
+            [mihari.core :as core]
+            [mihari.export :as export]
+            [mihari.ingest :as ingest]))
+
+(def server-name "mihari")
+(def server-version "0.1.0")
+(def default-protocol-version "2024-11-05")
+
+(def max-input-bytes
+  "1 回の tool 入力テキストの上限（UTF-8 バイト）。"
+  (* 5 1024 1024))
+
+;; ───────── JSON（ホスト） ─────────
+
+(defn ->json [x]
+  #?(:cljs (js/JSON.stringify (clj->js x))
+     :clj (throw (ex-info "mihari.mcp needs a JS host for JSON" {}))))
+
+(defn- utf8-length [s]
+  #?(:cljs (.-length (.encode (js/TextEncoder.) (str s)))
+     :clj (alength (.getBytes ^String (str s) "UTF-8"))))
+
+;; ───────── tool の宣言 ─────────
+
+(def ^:private level-names ["debug" "info" "warning" "error" "fatal"])
+
+(def tools
+  [{"name" "mihari_ingest_events"
+    "description" (str "Group Sentry data into Sentry-shaped issues: accepts an envelope (the body an SDK posts to "
+                       "/api/{project}/envelope/), event JSON (one object or an array) or a Sentry API /events/ response. "
+                       "Runs locally on the given text only: sends nothing, stores nothing, drops IP addresses, "
+                       "request headers, cookies and emails before grouping.")
+    "inputSchema" {"type" "object"
+                   "properties" {"text" {"type" "string"
+                                         "description" "Envelope or event JSON text, at most 5 MiB of UTF-8."}
+                                 "project" {"type" "string"
+                                            "description" "Project slug to file every event under. Defaults to the envelope DSN's project, the event's project, or \"mihari\"."}
+                                 "include_events" {"type" "boolean"
+                                                   "description" "Also return each issue's events in Sentry /events/ shape. Default false."}}
+                   "required" ["text"]
+                   "additionalProperties" false}}
+   {"name" "mihari_decide"
+    "description" (str "Apply mihari's triage rules: the priority (low/medium/high) for a level and its event and user "
+                       "counts, and optionally the next status for a status plus an action, with the regression flag. "
+                       "These are mihari's documented rules on Sentry's vocabulary, not Sentry's internal algorithm.")
+    "inputSchema" {"type" "object"
+                   "properties" {"level" {"type" "string" "enum" level-names}
+                                 "count" {"type" "integer" "minimum" 0
+                                          "description" "Events in the issue. Default 1."}
+                                 "user_count" {"type" "integer" "minimum" 0
+                                               "description" "Distinct users affected. Default 0."}
+                                 "status" {"type" "string" "enum" ["unresolved" "resolved" "ignored"]
+                                           "description" "Current issue status; give together with action."}
+                                 "action" {"type" "string" "enum" ["resolve" "ignore" "unresolve" "event"]
+                                           "description" "What happens next; \"event\" means a new event arrived. Give together with status."}}
+                   "required" ["level"]
+                   "additionalProperties" false}}])
+
+(def ^:private tool-index (into {} (map (juxt #(get % "name") identity)) tools))
+
+;; ───────── 入力の検査 ─────────
+
+(defn- check-args
+  "inputSchema の範囲（必須・未知キー・型・enum・minimum）だけを見る。
+  戻り: nil（通る）か、名前付きの理由文字列。"
+  [schema args]
+  (let [props (get schema "properties")
+        unknown (remove #(contains? props %) (keys args))
+        missing (remove #(contains? args %) (get schema "required"))]
+    (cond
+      (seq unknown) (str "unknown-argument: " (text/join ", " (sort unknown)))
+      (seq missing) (str "missing-argument: " (text/join ", " missing))
+      :else
+      (some (fn [[k v]]
+              (let [p (get props k)
+                    t (get p "type")]
+                (cond
+                  (and (= "string" t) (not (string? v))) (str "not-a-string: " k)
+                  (and (= "boolean" t) (not (boolean? v))) (str "not-a-boolean: " k)
+                  (and (= "integer" t) (not (integer? v))) (str "not-an-integer: " k)
+                  (and (get p "enum") (not (some #{v} (get p "enum")))) (str "not-allowed: " k)
+                  (and (get p "minimum") (< v (get p "minimum"))) (str "below-minimum: " k)
+                  :else nil)))
+            args))))
+
+;; ───────── tool の本体 ─────────
+
+(defn- error-result [reason] {:error reason})
+
+(defn ingest-events
+  "mihari_ingest_events。戻り {:result map} か {:error reason}。"
+  [{:strs [text project include_events]}]
+  (cond
+    (> (utf8-length text) max-input-bytes) (error-result "input-too-large: text exceeds 5 MiB")
+    (text/blank? text) (error-result "empty-input: text is blank")
+    :else
+    (let [{:keys [events skipped format error]} (ingest/ingest text (cond-> {} (seq project) (assoc :project project)))]
+      (if (= :bad-envelope-header error)
+        (error-result "unrecognised-input: neither event JSON nor an envelope")
+        (let [db (core/add-events core/empty-db events)
+              issues (export/issues-json db {})]
+          {:result (cond-> {"issues" issues
+                            "events_count" (count (:event-ids db))
+                            "skipped" skipped
+                            "format" (name format)
+                            "warnings" (cond-> []
+                                         error (conj (str (name error) ": stopped before the unreadable item"))
+                                         (< (count (:event-ids db)) (count events))
+                                         (conj (str (- (count events) (count (:event-ids db)))
+                                                    " duplicate event id(s) counted once")))}
+                     include_events
+                     (assoc "events" (into {} (map (fn [i] [(get i "id") (export/events-json db (get i "id"))]))
+                                           issues)))})))))
+
+(def ^:private action-codes {"unresolve" 0 "resolve" 1 "ignore" 2 "event" 3})
+
+(defn decide
+  "mihari_decide。guest と同じ判定（mihari.core の parity 対象関数）を呼ぶ。"
+  [{level "level" event-count "count" user-count "user_count" status "status" action "action"}]
+  (if (not= (some? status) (some? action))
+    (error-result "status-and-action-go-together: give both or neither")
+    (let [lvl (core/level->code level)
+          p (core/priority lvl (or event-count 1) (or user-count 0))]
+      (if (neg? p)
+        (error-result (str "unknown-level: " level))
+        {:result (cond-> {"priority" (core/code->priority p)}
+                   status
+                   (assoc "next_status" (core/code->status (core/next-status (core/status->code status)
+                                                                             (get action-codes action)))
+                          "regression" (= 1 (core/regression? (core/status->code status)
+                                                              (get action-codes action)))))}))))
+
+(def ^:private handlers
+  {"mihari_ingest_events" ingest-events
+   "mihari_decide" decide})
+
+(defn call-tool
+  "tool 名と引数（文字列キーの map）→ MCP の tools/call 結果。"
+  [tool-name args]
+  (let [tool (get tool-index tool-name)
+        args (or args {})
+        outcome (cond
+                  (nil? tool) (error-result (str "unknown-tool: " tool-name))
+                  (not (map? args)) (error-result "arguments-not-an-object")
+                  :else (or (some-> (check-args (get tool "inputSchema") args) error-result)
+                            ((get handlers tool-name) args)))]
+    (if-let [reason (:error outcome)]
+      {"content" [{"type" "text" "text" (->json {"error" reason})}]
+       "isError" true}
+      {"content" [{"type" "text" "text" (->json (:result outcome))}]
+       "structuredContent" (:result outcome)
+       "isError" false})))
+
+;; ───────── JSON-RPC ─────────
+
+(defn- rpc-result [id value] {"jsonrpc" "2.0" "id" id "result" value})
+(defn- rpc-error [id code message] {"jsonrpc" "2.0" "id" id "error" {"code" code "message" message}})
+
+(defn handle-request
+  "JSON-RPC の要求 map（文字列キー）→ 応答 map。通知（id 無し）には nil。"
+  [req]
+  (let [id (get req "id")
+        method (get req "method")
+        params (or (get req "params") {})
+        notification? (not (contains? req "id"))]
+    (cond
+      (not (string? method)) (when-not notification? (rpc-error id -32600 "invalid request: no method"))
+      (text/starts-with? method "notifications/") nil
+      notification? nil
+      (= method "initialize")
+      (rpc-result id {"protocolVersion" (or (get params "protocolVersion") default-protocol-version)
+                      "capabilities" {"tools" {}}
+                      "serverInfo" {"name" server-name "version" server-version}
+                      "instructions" (str "mihari: Sentry-compatible error grouping and triage rules. "
+                                          "Pure tools over the text you pass in; nothing is sent or stored.")})
+      (= method "ping") (rpc-result id {})
+      (= method "tools/list") (rpc-result id {"tools" tools})
+      (= method "tools/call") (rpc-result id (call-tool (get params "name") (get params "arguments")))
+      :else (rpc-error id -32601 (str "method not found: " method)))))
+
+(defn handle-line
+  "stdin の 1 行 → stdout に書く 1 行（改行なし）か nil。"
+  [line]
+  (when-not (text/blank? line)
+    (let [req (ingest/parse-json line)]
+      (if (map? req)
+        (some-> (handle-request req) ->json)
+        (->json (rpc-error nil -32700 "parse error"))))))
