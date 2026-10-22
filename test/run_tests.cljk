@@ -8,11 +8,15 @@
             [mihari.parity-test]
             [mihari.core-test]
             [mihari.ingest-test]
-            [mihari.view-test]))
+            [mihari.view-test]
+            [mihari.mcp-test]
+            [mcp-stdio-test]))
 
 (let [{:keys [fail error]} (run-tests 'mihari.parity-test
                                       'mihari.core-test
                                       'mihari.ingest-test
-                                      'mihari.view-test)]
+                                      'mihari.view-test
+                                      'mihari.mcp-test
+                                      'mcp-stdio-test)]
   (when (pos? (+ fail error))
     (set! (.-exitCode js/process) 1)))

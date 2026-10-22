@@ -1,0 +1,72 @@
+(ns mcp-stdio-test
+  "bin/mihari-mcp を子プロセスで起動し、itonami agent（kotoba-lang/itonami-agent
+  の itonami.agent.mcp）と同じやり方で話す: initialize → notifications/initialized
+  → 要求 を stdin に書いて閉じ、stdout から id の合う応答を拾い、終了コードを見る。
+
+  cwd は `/`、env は agent と同じ最小集合（PATH / HOME …）で起動する —— agent は
+  `cwd` を指定しない限り自分の cwd でサーバを起動し、env も絞る（exact-env）ので、
+  repo の中で起動したときだけ通るサーバは agent からは動かない。"
+  (:require ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]
+            [cljs.test :refer [deftest is testing]]
+            [kotoba.lang.text :as text]
+            [mihari.ingest :as ingest]
+            [mihari.mcp :as mcp]))
+
+(def ^:private server (path/resolve "bin/mihari-mcp"))
+
+(defn- agent-env []
+  (let [env (.-env js/process)]
+    (clj->js (into {} (keep (fn [k] (when-let [v (aget env k)] [k v])))
+                   ["PATH" "HOME" "TMPDIR" "LANG" "LC_ALL" "XDG_CONFIG_HOME"]))))
+
+(defn- run-server
+  "行（map）を JSON で流して {:exit n :responses {id response} :stderr s}。"
+  [requests]
+  (let [input (str (text/join "\n" (map mcp/->json requests)) "\n")
+        r (cp/spawnSync "kbb" #js [server]
+                        #js {:cwd "/" :env (agent-env) :input input :encoding "utf8"
+                             :timeout 60000 :maxBuffer (* 64 1024 1024)})]
+    {:exit (.-status r)
+     :stderr (str (.-stderr r))
+     :responses (into {}
+                      (keep (fn [line]
+                              (let [m (ingest/parse-json line)]
+                                (when (and (map? m) (contains? m "id")) [(get m "id") m]))))
+                      (text/split-lines (str (.-stdout r))))}))
+
+(def ^:private handshake
+  [{"jsonrpc" "2.0" "id" 1 "method" "initialize"
+    "params" {"protocolVersion" "2024-11-05" "capabilities" {}
+              "clientInfo" {"name" "itonami-agent" "version" "0.1"}}}
+   {"jsonrpc" "2.0" "method" "notifications/initialized" "params" {}}])
+
+(deftest agent-shaped-tools-list
+  (let [{:keys [exit responses]} (run-server (conj handshake {"jsonrpc" "2.0" "id" 2 "method" "tools/list" "params" {}}))]
+    (is (= 0 exit) "stdin の EOF で exit 0")
+    (is (= "mihari" (get-in responses [1 "result" "serverInfo" "name"])))
+    (is (= ["mihari_ingest_events" "mihari_decide"]
+           (mapv #(get % "name") (get-in responses [2 "result" "tools"]))))
+    (is (= 2 (count responses)) "通知には応答しない")))
+
+(deftest agent-shaped-tools-call
+  (let [envelope (fs/readFileSync "test/fixtures/basic.envelope" "utf8")
+        {:keys [exit responses]}
+        (run-server (into handshake
+                          [{"jsonrpc" "2.0" "id" 2 "method" "tools/call"
+                            "params" {"name" "mihari_ingest_events" "arguments" {"text" envelope}}}
+                           {"jsonrpc" "2.0" "id" 3 "method" "tools/call"
+                            "params" {"name" "mihari_decide" "arguments" {"level" "nope"}}}
+                           {"jsonrpc" "2.0" "id" 4 "method" "resources/list" "params" {}}]))]
+    (is (= 0 exit))
+    (testing "tools/call の結果は text（JSON）と structuredContent"
+      (let [r (get-in responses [2 "result"])
+            body (ingest/parse-json (get-in r ["content" 0 "text"]))]
+        (is (false? (get r "isError")))
+        (is (= 2 (get body "events_count")))
+        (is (= body (get r "structuredContent")))))
+    (testing "入力不正は isError"
+      (is (true? (get-in responses [3 "result" "isError"]))))
+    (testing "未知の method は -32601"
+      (is (= -32601 (get-in responses [4 "error" "code"]))))))

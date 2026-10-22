@@ -11,6 +11,7 @@
     "build:guest": "../../kotoba-lang/amu/bin/amu compile aiueos/mihari_core.cljk --target wasm32-browser --output aiueos/mihari_core.wasm",
     "test:wasm": "node test/guest_parity.mjs",
     "test:all": "npm run test && npm run test:guest && npm run test:wasm",
+    "mcp": "kbb bin/mihari-mcp",
     "preview": "K=${KOTOBA_LANG:-../../kotoba-lang}; kbb --backend sci --classpath \"src:site:$K/html/src:$K/css/src:$K/jp-go-digital-design-system/src:$K/text/src\" scripts/preview.cljk"
   }
 }

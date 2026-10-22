@@ -1,0 +1,106 @@
+(ns mihari.mcp-test
+  "mihari.mcp（MCP tool 面）の純関数のテスト。stdio 越しの振る舞いは
+  test/mcp_stdio_test.cljk が子プロセスで見る。"
+  (:require ["fs" :as fs]
+            [cljs.test :refer [deftest is testing]]
+            [kotoba.lang.text :as text]
+            [mihari.ingest :as ingest]
+            [mihari.mcp :as mcp]))
+
+(defn- fixture [f] (fs/readFileSync (str "test/fixtures/" f) "utf8"))
+
+(defn- call [tool args]
+  (let [r (mcp/call-tool tool args)
+        body (ingest/parse-json (get-in r ["content" 0 "text"]))]
+    {:error? (get r "isError") :body body :structured (get r "structuredContent")}))
+
+(deftest tools-list-declares-two-closed-schemas
+  (is (= ["mihari_ingest_events" "mihari_decide"] (mapv #(get % "name") mcp/tools)))
+  (doseq [t mcp/tools]
+    (testing (get t "name")
+      (is (= "object" (get-in t ["inputSchema" "type"])))
+      (is (false? (get-in t ["inputSchema" "additionalProperties"])))
+      (is (seq (get-in t ["inputSchema" "required"]))))))
+
+(deftest ingest-events-groups-an-envelope
+  (let [{:keys [error? body structured]} (call "mihari_ingest_events" {"text" (fixture "basic.envelope")})]
+    (is (false? error?))
+    (is (= body structured) "text と structuredContent は同じ値")
+    (is (= "envelope" (get body "format")))
+    (is (= 2 (get body "events_count")))
+    (is (= {"attachment" 1 "session" 1} (get body "skipped")))
+    (testing "Sentry の issue 形（count は文字列、userCount は数）"
+      (let [i (first (filter #(text/starts-with? (get % "title") "TypeError") (get body "issues")))]
+        (is (= "1" (get i "count")))
+        (is (number? (get i "userCount")))
+        (is (= "42" (get-in i ["project" "slug"])))
+        (is (= "ongoing" (get i "substatus")))))
+    (testing "events は要求したときだけ"
+      (is (nil? (get body "events"))))))
+
+(deftest ingest-events-keeps-the-privacy-rule
+  (let [{:keys [body]} (call "mihari_ingest_events" {"text" (fixture "basic.envelope") "include_events" true})
+        out (mcp/->json body)]
+    (is (= 2 (count (get body "events"))))
+    (is (not (text/includes? out "203.0.113.7")) "IP は出ない")
+    (is (not (text/includes? out "alice@example.com")) "email は出ない")
+    (is (not (text/includes? out "sid=secret")) "cookie は出ない")))
+
+(deftest ingest-events-project-override-and-json-input
+  (let [{:keys [body]} (call "mihari_ingest_events" {"text" (fixture "events.json") "project" "web"})]
+    (is (= "event-json" (get body "format")))
+    (is (every? #(= "web" (get-in % ["project" "slug"])) (get body "issues")))
+    (is (every? #(text/starts-with? (get % "shortId") "WEB-") (get body "issues")))))
+
+(deftest ingest-events-refuses-bad-input-by-name
+  (is (= "empty-input: text is blank" (get (:body (call "mihari_ingest_events" {"text" "  "})) "error")))
+  (is (= "unrecognised-input: neither event JSON nor an envelope"
+         (get (:body (call "mihari_ingest_events" {"text" "not json at all"})) "error")))
+  (is (= "missing-argument: text" (get (:body (call "mihari_ingest_events" {})) "error")))
+  (is (= "unknown-argument: dsn" (get (:body (call "mihari_ingest_events" {"text" "{}" "dsn" "x"})) "error")))
+  (is (= "not-a-string: text" (get (:body (call "mihari_ingest_events" {"text" 3})) "error")))
+  (is (text/starts-with? (get (:body (call "mihari_ingest_events"
+                                           {"text" (apply str (repeat (inc mcp/max-input-bytes) "a"))}))
+                              "error")
+                         "input-too-large"))
+  (is (true? (:error? (call "mihari_ingest_events" {"text" "  "})))))
+
+(deftest decide-matches-the-guest-rules
+  (testing "priority だけ"
+    (is (= {"priority" "high"} (:body (call "mihari_decide" {"level" "fatal"}))))
+    (is (= {"priority" "medium"} (:body (call "mihari_decide" {"level" "error" "count" 5 "user_count" 2}))))
+    (is (= {"priority" "high"} (:body (call "mihari_decide" {"level" "error" "count" 100}))))
+    (is (= {"priority" "low"} (:body (call "mihari_decide" {"level" "warning" "user_count" 9})))))
+  (testing "status + action（guest の next-status / regression?）"
+    (is (= {"priority" "high" "next_status" "unresolved" "regression" true}
+           (:body (call "mihari_decide" {"level" "error" "count" 120 "status" "resolved" "action" "event"}))))
+    (is (= {"priority" "medium" "next_status" "ignored" "regression" false}
+           (:body (call "mihari_decide" {"level" "error" "status" "ignored" "action" "event"}))))
+    (is (= "resolved" (get (:body (call "mihari_decide" {"level" "info" "status" "unresolved" "action" "resolve"}))
+                           "next_status"))))
+  (testing "名前付きの拒否"
+    (is (= "not-allowed: level" (get (:body (call "mihari_decide" {"level" "loud"})) "error")))
+    (is (= "status-and-action-go-together: give both or neither"
+           (get (:body (call "mihari_decide" {"level" "error" "status" "resolved"})) "error")))
+    (is (= "below-minimum: count" (get (:body (call "mihari_decide" {"level" "error" "count" -1})) "error")))
+    (is (= "not-an-integer: user_count" (get (:body (call "mihari_decide" {"level" "error" "user_count" 1.5})) "error")))))
+
+(deftest json-rpc-envelope
+  (testing "initialize は client の protocolVersion を返す"
+    (is (= "2025-06-18" (get-in (mcp/handle-request {"jsonrpc" "2.0" "id" 1 "method" "initialize"
+                                                     "params" {"protocolVersion" "2025-06-18"}})
+                                ["result" "protocolVersion"])))
+    (is (= "2024-11-05" (get-in (mcp/handle-request {"jsonrpc" "2.0" "id" 1 "method" "initialize"})
+                                ["result" "protocolVersion"]))))
+  (testing "通知には応答しない"
+    (is (nil? (mcp/handle-request {"jsonrpc" "2.0" "method" "notifications/initialized"}))))
+  (testing "ping / 未知の method / 壊れた行"
+    (is (= {} (get (mcp/handle-request {"jsonrpc" "2.0" "id" 7 "method" "ping"}) "result")))
+    (is (= -32601 (get-in (mcp/handle-request {"jsonrpc" "2.0" "id" 8 "method" "resources/list"}) ["error" "code"])))
+    (is (= -32700 (get-in (ingest/parse-json (mcp/handle-line "{oops")) ["error" "code"])))
+    (is (nil? (mcp/handle-line "   "))))
+  (testing "未知の tool は isError（JSON-RPC の error ではない）"
+    (let [r (mcp/handle-request {"jsonrpc" "2.0" "id" 9 "method" "tools/call"
+                                 "params" {"name" "mihari_delete_everything" "arguments" {}}})]
+      (is (true? (get-in r ["result" "isError"])))
+      (is (nil? (get r "error"))))))

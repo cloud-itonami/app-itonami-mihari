@@ -22,6 +22,7 @@ mihari を「サーバに状態を置かない Sentry 互換の dapp」として
 | adapter | `src/mihari/core.cljk` — guest と同名・同結果 + issue ストア（純粋な値） | **実装済み・実測**（kbb） |
 | 取り込み・書き出し | `src/mihari/ingest.cljk` / `export.cljk` | **実装済み・実測**（kbb + ブラウザ） |
 | 画面 | `src/mihari/view.cljk` + `site/app.cljk`（Re-frame/Reagent on scittle） | **実測**（ローカル配信、下記） |
+| agent 統合（MCP） | `bin/mihari-mcp`（stdio）+ `src/mihari/mcp.cljk` — `mihari_ingest_events` / `mihari_decide`。adapter を呼ぶ純関数で、状態を持たない | **実装済み・実測**（下記）。peer run では無効（itonami-agent 側の規則） |
 | 状態 | `localStorage`（キー `itonami.mihari.v1`）、1 ブラウザに閉じる | 実装済み。分散は未実装 |
 | 分散状態 | ADR 0005 の `mon` / `ito` / `nuno` | **未実装**（設計のみ、下記） |
 | 本家 API 直結 | `kotoba.app.client-runtime.v1` ブローカー経由の operation ごとの同意 | **未実装・ブロック中**（下記） |
@@ -59,6 +60,20 @@ mihari を「サーバに状態を置かない Sentry 互換の dapp」として
   - **消去**: 「すべて消去」で 0 件になり、localStorage のキーも消えた。
   - **外部通信**: `performance.getEntriesByType('resource')` に同一オリジン以外は 0 件だった。
 
+### agent 統合（MCP、2026-10-22、Linear JUN-297）
+
+- `npm test` → **27 tests, 245 assertions, 0 failures**。
+  - MCP の純関数のテスト（`test/mihari/mcp_test.cljk`）と stdio テスト（`test/mcp_stdio_test.cljk`）を含む。
+  - stdio テストは `bin/mihari-mcp` を子プロセスで起動する。cwd は `/`、env は agent と同じ最小集合（PATH／HOME…）。
+  - agent と同じく initialize → notifications/initialized → 要求 を流して stdin を閉じ、応答と exit 0 を確かめる。
+  - `bin/mihari-mcp` を一時的に退けると 9 failures になるので、子プロセスの経路は空振りしていない。
+- kotoba-lang/itonami-agent（`kotoba-lang/main` `709c948` の `src` を git archive で取り出して使用）の MCP クライアントで呼んだ。
+  - `itonami.agent.mcp/discover` → `mcp__mihari__mihari_ingest_events` と `mcp__mihari__mihari_decide`、errors なし。
+  - `itonami.agent.mcp/call` → `mihari_decide` は `{"priority":"high","next_status":"unresolved","regression":true}`。
+  - `mihari_ingest_events` は fixture の envelope から 2 issue（Sentry の issue 形）を返した。
+  - 出力に fixture の IP・email・cookie は含まれなかった。
+- 初回起動だけ kbb が依存（`kotoba-lang/text` `bc551a3`）を取得する。そのメッセージは stderr に出て、stdout は JSON-RPC の行だけだった。
+
 ## 実測した「動かない」／確かめていないもの
 
 - **aiueos への配線は未実装**。
@@ -69,7 +84,8 @@ mihari を「サーバに状態を置かない Sentry 互換の dapp」として
 - **JVM では取り込み・書き出しが動かない**。
   - JSON の parse と UTF-8 の切り出しを JS ホスト（ブラウザ・kbb）で行う。依存ゼロを保つため JVM の分岐は ex-info を投げる。
   - 判定（`mihari.core`）は JVM でも動く形で書いてあるが、JVM のテストは回していない。
-- **app.itonami.cloud への公開は未実施**（network-awai/cloud-itonami 側の作業）。
+- **MCP の tool も guest の wasm を呼ばない**。画面と同じく adapter で判定し、guest との一致は parity 表で担保する。
+- **itonami agent が model の判断で tool を呼ぶ run（推論 rail 経由）は試していない**。実測したのは MCP クライアントの discover / call まで。
 - **ファイル選択ダイアログからの取り込みは手で操作していない**。
   - 確かめたのは、`File` を effect に渡す経路まで。
 - **本家 Sentry の実データでの検証はしていない**。fixture は SDK の文書化された形に沿った合成データ。

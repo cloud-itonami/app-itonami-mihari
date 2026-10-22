@@ -1,0 +1,43 @@
+#!/usr/bin/env kbb
+;; mihari の stdio MCP サーバ（Linear JUN-297）。
+;;
+;; itonami agent（kotoba-lang/itonami-agent）は呼び出しのたびにこのプロセスを
+;; 1 つ起動し、initialize → notifications/initialized → 要求 の 3 行を stdin に
+;; 書いて閉じ、stdout から id の合う応答を拾う。だからこのファイルの約束は:
+;;
+;;   - stdout には JSON-RPC の行だけを書く（ログは stderr）
+;;   - 1 行読んだら、応答があれば 1 行書く（通知には書かない）
+;;   - stdin の EOF で exit 0（process.exit で打ち切らない —— macOS の pipe への
+;;     書き込みは非同期なので、未送の応答を捨てることになる）
+;;
+;; tool の中身は src/mihari/mcp.cljk（純関数）。ネットワーク・ファイル書き込み・
+;; 状態保存はしない。
+;;
+;; 任意の cwd から `kbb /abs/path/bin/mihari-mcp` で起動できる: kbb はこの
+;; ファイルの位置から nbb.edn（repo root）を見つけ、kotoba-lang/text を pin
+;; （bc551a3）どおり gitlibs から解決する。src/ は念のためここでも足す。
+(ns mihari-mcp
+  (:require ["node:path" :as path]
+            ["node:readline" :as readline]
+            [nbb.classpath :as classpath]
+            [nbb.core :refer [*file*]]))
+
+(def repo-directory (path/resolve (path/dirname *file*) ".."))
+
+(classpath/add-classpath (path/resolve repo-directory "src"))
+(require '[mihari.mcp :as mcp])
+
+(defn- write-line! [s]
+  (.write js/process.stdout (str s "\n")))
+
+(defn- handle! [line]
+  (try
+    (some-> (mcp/handle-line line) write-line!)
+    (catch :default e
+      (.write js/process.stderr (str "mihari-mcp: " (.-message e) "\n"))
+      (write-line! (mcp/->json {"jsonrpc" "2.0" "id" nil
+                                "error" {"code" -32603 "message" "internal error"}})))))
+
+(let [rl (.createInterface readline #js {:input js/process.stdin :terminal false})]
+  (.on rl "line" handle!)
+  (.on rl "close" (fn [] (set! (.-exitCode js/process) 0))))
