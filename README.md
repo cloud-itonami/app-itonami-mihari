@@ -97,7 +97,10 @@ mcp_servers:
     args: ["/abs/path/to/cloud-itonami/app-itonami-mihari/bin/mihari-mcp"]
 ```
 
-- `cwd` は要らない。kbb はこのファイルの位置から `nbb.edn` を見つけ、`kotoba-lang/text` を pin（`bc551a3`）どおり gitlibs から解決する。
+- `cwd` は要らない。cwd がこの repo でなければ、launcher が repo を cwd にして自分を起動し直す。
+  - kbb は cwd の `nbb.edn` から `kotoba-lang/text` を pin（`bc551a3`）どおり gitlibs で解決する。
+  - cwd が別の場所だと、kbb の既定 classpath にある手元の `kotoba-lang/text` checkout が先に読まれるため（実測 2026-10-22）。
+  - 再起動の分、起動は 1 回分遅くなる。
   - 初回だけ依存の取得が走る。そのメッセージは stderr に出て、stdout は JSON-RPC だけ。
 - agent からは `mcp__mihari__<tool>` という名前で見える。
 
