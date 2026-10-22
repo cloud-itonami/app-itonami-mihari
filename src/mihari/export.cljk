@@ -1,0 +1,100 @@
+(ns mihari.export
+  "書き出し — Sentry と同じ形の JSON と、取り込み直せる envelope。
+
+  - `issues-json`: Sentry API の issue 一覧（`GET /api/0/projects/{org}/{project}/issues/`）
+    の各要素と同じキー。`count` は Sentry と同じく**文字列**、`userCount` は数。
+    resolved に event が来た issue は `substatus` を \"regressed\" にする。
+  - `events-json`: `GET /api/0/issues/{issue_id}/events/` の各要素と同じキー。
+  - `envelope`: 保存してある event を envelope（item ごとに `length` 付き）に
+    戻す。mihari.ingest/ingest にそのまま食わせると同じ db に戻る（冪等）。
+
+  取り込み時に落とした IP・request header・cookie・email は、ここにも出ない。"
+  (:require [kotoba.lang.text :as text]
+            [mihari.core :as core]))
+
+(defn- project-ref [p] {"id" p "slug" p "name" p})
+
+(defn issue->sentry [issue]
+  {"id" (:id issue)
+   "shortId" (:short-id issue)
+   "title" (:title issue)
+   "culprit" (:culprit issue)
+   "level" (:level issue)
+   "status" (:status issue)
+   "substatus" (cond (= "resolved" (:status issue)) nil
+                     (= "ignored" (:status issue)) "archived_forever"
+                     (:regressed? issue) "regressed"
+                     :else "ongoing")
+   "priority" (:priority issue)
+   "type" (:type issue)
+   "metadata" (into {} (remove (comp nil? val))
+                    {"type" (get-in issue [:metadata :type])
+                     "value" (get-in issue [:metadata :value])})
+   "platform" (:platform issue)
+   "count" (str (:count issue))
+   "userCount" (core/user-count issue)
+   "firstSeen" (:first-seen issue)
+   "lastSeen" (:last-seen issue)
+   "project" (project-ref (:project issue))
+   "firstRelease" (some-> (:release-first issue) (#(hash-map "version" %)))
+   "lastRelease" (some-> (:release-last issue) (#(hash-map "version" %)))})
+
+(defn issues-json
+  "filters は mihari.core/issue-list と同じ。"
+  ([db] (issues-json db {}))
+  ([db filters] (mapv issue->sentry (core/issue-list db filters))))
+
+(defn- tags-of [ev]
+  (let [t (get-in ev [:raw "tags"])]
+    (cond (map? t) (mapv (fn [[k v]] {"key" (str k) "value" (str v)}) t)
+          (sequential? t) (vec (keep (fn [x] (cond (map? x) {"key" (str (get x "key")) "value" (str (get x "value"))}
+                                                   (sequential? x) {"key" (str (first x)) "value" (str (second x))}))
+                                     t))
+          :else [])))
+
+(defn event->sentry [iid ev]
+  {"id" (:event-id ev)
+   "eventID" (:event-id ev)
+   "groupID" iid
+   "title" (:title ev)
+   "message" (or (:message ev) "")
+   "platform" (:platform ev)
+   "dateCreated" (:timestamp ev)
+   "event.type" (if (= :transaction (:kind ev)) "transaction" (if (:exception-type ev) "error" "default"))
+   "tags" (into [{"key" "level" "value" (:level ev)}]
+                (remove #(= "level" (get % "key")))
+                (tags-of ev))
+   "user" (some-> (get-in ev [:raw "user"]) (select-keys ["id" "username"]) not-empty)})
+
+(defn events-json [db iid]
+  (mapv #(event->sentry iid %) (core/issue-events db iid)))
+
+;; ───────── envelope ─────────
+
+(defn- ->json [x]
+  #?(:cljs (js/JSON.stringify (clj->js x))
+     :clj (throw (ex-info "mihari.export needs a JS host for JSON" {}))))
+
+(defn- utf8-length [s]
+  #?(:cljs (.-length (.encode (js/TextEncoder.) s))
+     :clj (alength (.getBytes ^String s "UTF-8"))))
+
+(defn envelope
+  "保存してある全 event（scrub 済みの raw）を 1 本の envelope にする。
+  sent-at は呼び手が渡す（時計を読まない — 同じ db から同じ文字列が出る）。"
+  [db sent-at]
+  (let [evs (->> (:events db) vals (apply concat) (sort-by :timestamp))
+        lines (mapcat (fn [ev]
+                        (let [payload (->json (assoc (:raw ev) "event_id" (:event-id ev) "project" (:project ev)))]
+                          [(->json {"type" (if (= :transaction (:kind ev)) "transaction" "event")
+                                    "length" (utf8-length payload)})
+                           payload]))
+                      evs)]
+    (str (text/join "\n" (cons (->json (cond-> {"sdk" {"name" "mihari.export" "version" "1"}}
+                                         sent-at (assoc "sent_at" sent-at)))
+                               lines))
+         "\n")))
+
+(defn pretty-json [x]
+  #?(:cljs (js/JSON.stringify (clj->js x) nil 2)
+     :clj (pr-str x)))

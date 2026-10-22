@@ -1,0 +1,271 @@
+(ns mihari.ingest
+  "取り込み — Sentry の envelope / event JSON を mihari の正規化 event にする。
+
+  受けるもの:
+  - **envelope**（SDK が `/api/{project}/envelope/` へ送る形）。1 行目が envelope
+    header の JSON、その後に「item header の JSON 1 行 + payload」が続く。payload
+    は item header の `length`（UTF-8 のバイト数）で区切られるか、無ければ次の改行
+    まで。`length` はバイト数なので、文字列ではなく UTF-8 のバイト列の上で切る。
+  - **event JSON**（1 件のオブジェクト、または配列）。Sentry API の
+    `/events/` 応答の形（`eventID` / `dateCreated` / `tags` が配列）も受ける。
+
+  item のうち event と transaction だけを取り込み、それ以外（attachment /
+  session / client_report …）は種類ごとに数えて :skipped で返す。
+
+  **プライバシーの規則（取り込み時に落とす）**: `user.ip_address`、
+  `request.headers`、`request.cookies`、`request.env`（REMOTE_ADDR 等）、IP を
+  名前に含む tag。user の email は保持せず、利用者数を数えるための鍵として
+  fingerprint 値だけを残す。落としたものは保存も書き出しもされない。
+
+  JSON の parse はホストの `JSON.parse`（ブラウザと kbb）。JVM の分岐は
+  依存ゼロを保つため実装していない（呼ぶと ex-info）。"
+  (:require [kotoba.lang.text :as text]
+            [mihari.core :as core]))
+
+;; ───────── JSON / UTF-8（ホスト） ─────────
+
+(defn parse-json
+  "JSON 文字列 → Clojure 値（キーは文字列のまま）。壊れていれば nil。"
+  [s]
+  #?(:cljs (try (js->clj (js/JSON.parse s)) (catch :default _ nil))
+     :clj (throw (ex-info "mihari.ingest/parse-json needs a JS host (browser or kbb)" {:input-length (count s)}))))
+
+(defn- utf8 [s]
+  #?(:cljs (.encode (js/TextEncoder.) s)
+     :clj (.getBytes ^String s "UTF-8")))
+
+(defn- byte-count [bs] #?(:cljs (.-length bs) :clj (alength ^bytes bs)))
+
+(defn- byte-at [bs i] #?(:cljs (aget bs i) :clj (bit-and 0xff (aget ^bytes bs (int i)))))
+
+(defn- decode [bs start end]
+  #?(:cljs (.decode (js/TextDecoder.) (.subarray bs start end))
+     :clj (String. ^bytes bs (int start) (int (- end start)) "UTF-8")))
+
+(defn- newline-from
+  "start 以降で最初の \\n の位置。無ければ長さ。"
+  [bs start]
+  (let [n (byte-count bs)]
+    (loop [i start]
+      (cond (>= i n) n
+            (= 10 (byte-at bs i)) i
+            :else (recur (inc i))))))
+
+;; ───────── envelope ─────────
+
+(defn split-envelope
+  "envelope 文字列 → {:header map :items [{:header map :payload string}] :error kw?}。
+  壊れた item header に当たったら、そこまでを返して :error を立てる。"
+  [s]
+  (let [bs (utf8 s)
+        n (byte-count bs)
+        end0 (newline-from bs 0)
+        header (parse-json (decode bs 0 end0))]
+    (if-not (map? header)
+      {:header nil :items [] :error :bad-envelope-header}
+      (loop [pos (inc end0) items []]
+        (if (>= pos n)
+          {:header header :items items}
+          (let [hend (newline-from bs pos)
+                line (decode bs pos hend)]
+            (if (text/blank? line)
+              (recur (inc hend) items)
+              (let [ih (parse-json line)]
+                (if-not (map? ih)
+                  {:header header :items items :error :bad-item-header}
+                  (let [pstart (inc hend)
+                        len (get ih "length")
+                        pend (if (and (number? len) (>= len 0))
+                               (min n (+ pstart len))
+                               (newline-from bs (min n pstart)))
+                        payload (if (< pstart n) (decode bs pstart pend) "")]
+                    (recur (inc pend) (conj items {:header ih :payload payload}))))))))))))
+
+(defn- dsn-project
+  "DSN `https://key@host/42` → \"42\"。"
+  [dsn]
+  (when (string? dsn)
+    (let [i (text/last-index-of dsn "/")]
+      (when (and i (< (inc i) (count dsn)))
+        (let [p (subs dsn (inc i))] (when-not (text/blank? p) p))))))
+
+;; ───────── event の正規化 ─────────
+
+(defn- ip-key? [k]
+  (let [k (text/lower (str k))]
+    (or (= k "ip") (text/includes? k "ip_address") (= k "client_ip")
+        (= k "user.ip") (= k "remote_addr"))))
+
+(defn- scrub-user
+  "ip_address と email を落とす。id も username も無く email だけの利用者は、
+  email の fingerprint を id にする（数えられるように。email 自体は残さない）。"
+  [u]
+  (let [email (get u "email")
+        u (cond-> u
+            (and (some? email) (nil? (get u "id")) (nil? (get u "username")))
+            (assoc "id" (str "email#" (core/fingerprint-str (text/lower (str email))))))]
+    (dissoc u "ip_address" "email")))
+
+(defn scrub
+  "プライバシーの規則で落とすものを落とした event（文字列キーの map）。"
+  [ev]
+  (let [tags (get ev "tags")
+        tags' (cond
+                (map? tags) (into {} (remove (fn [[k _]] (ip-key? k))) tags)
+                (sequential? tags) (vec (remove (fn [t]
+                                                  (cond (map? t) (ip-key? (get t "key"))
+                                                        (sequential? t) (ip-key? (first t))
+                                                        :else false))
+                                                tags))
+                :else tags)]
+    (cond-> ev
+      (map? (get ev "user")) (update "user" scrub-user)
+      (map? (get ev "request")) (update "request" dissoc "headers" "cookies" "env")
+      (some? tags) (assoc "tags" tags'))))
+
+(defn- message-of [ev]
+  (let [m (get ev "message")
+        le (get ev "logentry")]
+    (cond
+      (string? m) m
+      (map? m) (or (get m "formatted") (get m "message"))
+      (map? le) (or (get le "formatted") (get le "message"))
+      :else nil)))
+
+(defn- exception-values [ev]
+  (let [ex (get ev "exception")]
+    (cond (map? ex) (vec (get ex "values"))
+          (sequential? ex) (vec ex)
+          :else [])))
+
+(defn- frame-label [f]
+  (let [where (or (get f "module") (get f "filename") (get f "abs_path"))
+        fn* (get f "function")]
+    (cond (and where fn*) (str where " in " fn*)
+          :else (or where fn*))))
+
+(defn- culprit-of [ev main-ex]
+  (or (get ev "culprit")
+      (get ev "transaction")
+      (let [frames (get-in main-ex ["stacktrace" "frames"])
+            in-app (filter #(true? (get % "in_app")) frames)]
+        ;; frames は古い呼び出し → 新しい呼び出しの順。最後が例外の発生地点。
+        (some-> (or (last in-app) (last frames)) frame-label))))
+
+(defn- tag-value [ev k]
+  (let [tags (get ev "tags")]
+    (cond (map? tags) (get tags k)
+          (sequential? tags) (some (fn [t] (cond (map? t) (when (= k (get t "key")) (get t "value"))
+                                                 (sequential? t) (when (= k (first t)) (second t))))
+                                   tags)
+          :else nil)))
+
+(defn- iso-time [ts]
+  (cond
+    (number? ts) #?(:cljs (.toISOString (js/Date. (* ts 1000)))
+                    :clj (str (java.time.Instant/ofEpochMilli (long (* ts 1000)))))
+    (string? ts) ts
+    :else nil))
+
+(defn- user-key
+  "利用者数を数えるための鍵。scrub 済みの user の id → username。email だけの
+  利用者は scrub が email の fingerprint を id にしてある。IP しか無い event は
+  数えない（IP は取り込み時に落とすので）。"
+  [ev]
+  (let [u (get ev "user")]
+    (when (map? u)
+      (cond (some? (get u "id")) (str "id:" (get u "id"))
+            (some? (get u "username")) (str "username:" (get u "username"))
+            :else nil))))
+
+(defn- grouping-of [ev main-ex message]
+  (let [default (cond
+                  main-ex (str (get main-ex "type")
+                               (when-let [v (not-empty (str (or (get main-ex "value") "")))] (str ": " v))
+                               (when-let [f (some-> (get-in main-ex ["stacktrace" "frames"]) last frame-label)]
+                                 (str " @ " f)))
+                  message message
+                  :else (str "event " (or (get ev "event_id") (get ev "eventID") (get ev "id"))))
+        fp (get ev "fingerprint")]
+    (if (and (sequential? fp) (seq fp))
+      (text/join " | " (map (fn [part] (if (= "{{ default }}" part) default (str part))) fp))
+      default)))
+
+(defn normalize-event
+  "Sentry event（文字列キーの map、scrub 済みでなくてよい）→ mihari の event。
+  ctx: {:project … :kind :event|:transaction}。"
+  [raw {:keys [project kind]}]
+  (let [ev (scrub raw)
+        exs (exception-values ev)
+        main-ex (last exs)
+        message (message-of ev)
+        ex-type (not-empty (str (or (get main-ex "type") "")))
+        ex-value (not-empty (str (or (get main-ex "value") "")))
+        level (or (get ev "level") (tag-value ev "level") (if (= kind :transaction) "info" "error"))
+        title (or (get ev "title")
+                  (cond (and ex-type ex-value) (str ex-type ": " ex-value)
+                        ex-type ex-type
+                        message message
+                        (= kind :transaction) (or (get ev "transaction") "transaction")
+                        :else "<no title>"))
+        eid (str (or (get ev "event_id") (get ev "eventID") (get ev "id")
+                     (str "mihari-" (core/fingerprint-str (pr-str raw)))))]
+    {:event-id eid
+     :kind (or kind :event)
+     :timestamp (iso-time (or (get ev "timestamp") (get ev "dateCreated") (get ev "received")))
+     :level (or (core/code->level (core/level->code level)) "error")
+     :platform (get ev "platform")
+     :title title
+     :message message
+     :exception-type ex-type
+     :exception-value ex-value
+     :culprit (culprit-of ev main-ex)
+     :release (or (get ev "release") (tag-value ev "release"))
+     :environment (or (get ev "environment") (tag-value ev "environment"))
+     :user-key (user-key ev)
+     :grouping (grouping-of ev main-ex message)
+     :project (str (or project (get ev "project") (get ev "projectID") "mihari"))
+     :raw ev}))
+
+;; ───────── 入口 ─────────
+
+(def ^:private kept-items #{"event" "transaction"})
+
+(defn ingest-envelope [s]
+  (let [{:keys [header items error]} (split-envelope s)
+        project (dsn-project (get header "dsn"))]
+    (reduce (fn [acc {ih :header payload :payload}]
+              (let [t (get ih "type")]
+                (if (contains? kept-items t)
+                  (let [ev (parse-json payload)]
+                    (if (map? ev)
+                      (update acc :events conj
+                              (normalize-event (cond-> ev
+                                                 (and (nil? (get ev "event_id")) (get header "event_id"))
+                                                 (assoc "event_id" (get header "event_id")))
+                                               {:project project :kind (keyword t)}))
+                      (update-in acc [:skipped "unparseable"] (fnil inc 0))))
+                  (update-in acc [:skipped (str t)] (fnil inc 0)))))
+            {:events [] :skipped {} :format :envelope :error error}
+            items)))
+
+(defn ingest
+  "貼り付け・ファイルの中身を判別して取り込む。
+  戻り: {:events [正規化 event] :skipped {type n} :format kw :error kw?}。
+  全体が 1 つの JSON として読めれば event JSON、読めなければ envelope。"
+  ([s] (ingest s {}))
+  ([s {:keys [project]}]
+   (let [s (str s)]
+     (if (text/blank? s)
+       {:events [] :skipped {} :format :empty}
+       (let [whole (parse-json s)]
+         (cond
+           (map? whole) {:events [(normalize-event whole {:project project :kind :event})]
+                         :skipped {} :format :event-json}
+           (sequential? whole) {:events (vec (keep (fn [e] (when (map? e) (normalize-event e {:project project :kind :event})))
+                                                   whole))
+                                :skipped (let [bad (count (remove map? whole))]
+                                           (if (pos? bad) {"not-an-object" bad} {}))
+                                :format :event-json}
+           :else (cond-> (ingest-envelope s)
+                   project (update :events (fn [evs] (mapv #(assoc % :project project) evs))))))))))

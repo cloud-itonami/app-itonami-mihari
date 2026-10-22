@@ -1,0 +1,16 @@
+{:paths ["src"]
+ ;; ブラウザに配るのは src/ と site/app.cljk。依存は kotoba.lang.text だけで、
+ ;; 公開物にはそのソースを同梱する（site/site.edn の :external）。
+ ;; テストは kbb（package.json の test）。JVM の test runner は持たない ——
+ ;; JSON の parse と UTF-8 の切り出しを JS ホストで行うため（src/mihari/ingest.cljk）。
+ :deps {io.github.kotoba-lang/text {:git/url "https://github.com/kotoba-lang/text.git"
+                                    :git/sha "bc551a3ecc68e551ba1dd2fcb22d5f1b8dd7805d"}}
+ :aliases
+ {:test {:extra-paths ["test"]}
+  ;; 公開ページの殻（site/mihari/page.cljk）は DADS と kotoba-lang/html を引く。
+  ;; ライブラリ本体の :paths からは外してある。
+  :site {:extra-paths ["site"]
+         :extra-deps {io.github.kotoba-lang/jp-go-dds
+                      {:local/root "../../kotoba-lang/jp-go-digital-design-system"}
+                      io.github.kotoba-lang/html
+                      {:local/root "../../kotoba-lang/html"}}}}}

@@ -1,0 +1,182 @@
+(ns mihari.guest
+  "mihari エラー見張りの判断コア — aiueos guest（pure judgment, :effects #{}）。
+
+  Sentry 互換の dapp だが、ここにあるのは **mihari 自身の規則**であって Sentry
+  本家の内部アルゴリズムの再現ではない（priority の決め方など）。取り込み・
+  グルーピングの文字列処理・保存・描画はこの guest の外（src/mihari/*.cljk）。
+  文字列は扱わないので、ハッシュしたい文字列は adapter が UTF-16 code unit の
+  i64 ベクトルにして渡す。
+
+  符号（src/mihari/core.cljk と共有）:
+    level    debug=0 info=1 warning=2 error=3 fatal=4（Sentry の level 文字列）
+    status   unresolved=0 resolved=1 ignored=2（kotoba-lang/com-sentry の enum）
+    action   unresolve=0 resolve=1 ignore=2 event=3（新しい event が届いた）
+    priority low=0 medium=1 high=2
+  不正な入力には -1 を返す（判定系の 0/1 関数は 0）。
+
+  parity: test/fixtures/parity.edn の 47 行を、関数ごとに 1 本の test-* に
+  まとめて手で写してある（fingerprint 7 行 / next-status 10 / regression? 4 /
+  priority 11 / level-at-least? 4 / sampled? 8 / max-level 3 + 7 行の和 1 本）。
+  表に行を足したら、ここにも足すこと。
+
+  テストはゼロ引数 `test-*`（戻り 1 = pass、0 = fail）。実行:
+  <superproject>/orgs/kotoba-lang/amu/bin/amu test aiueos/mihari_core.cljk"
+  (:export [main fingerprint next-status regression? priority level-at-least?
+            sampled? max-level
+            test-fingerprint test-fingerprint-sum test-next-status
+            test-regression test-priority test-level-at-least test-sampled
+            test-max-level]))
+
+(defn main [] :i64
+  0)
+
+;; --- 余り（i64 の quot は 0 方向への切り捨て。adapter の cljs quot と同じ） ---
+
+(defn- rem* [a :i64 m :i64] :i64
+  (- a (* m (quot a m))))
+
+(defn- floor-mod [a :i64 m :i64] :i64
+  (let [r (rem* a m)]
+    (if (< r 0) (+ r m) r)))
+
+;; --- fingerprint: h = (h*31 + c) mod 2147483647、初期値 7 -----------------
+;; h < 2^31 なので h*31 + c < 2^36 —— JS の double でも正確に同じ数になる。
+
+(defn fingerprint [codes :vector-i64] :i64
+  (fingerprint-at codes (vector-count codes) 0 7))
+
+(defn- fingerprint-at [codes :vector-i64 n :i64 i :i64 h :i64] :i64
+  (if (< i n)
+    (fingerprint-at codes n (+ i 1) (rem* (+ (* h 31) (vector-at codes i)) 2147483647))
+    h))
+
+;; --- status 遷移 -------------------------------------------------------------
+
+(defn- valid-status [s :i64] :i64
+  (if (and (>= s 0) (<= s 2)) 1 0))
+
+(defn- valid-action [a :i64] :i64
+  (if (and (>= a 0) (<= a 3)) 1 0))
+
+(defn next-status [status :i64 action :i64] :i64
+  (if (= (+ (valid-status status) (valid-action action)) 2)
+    (if (= action 3)
+      (if (= status 1) 0 status)
+      action)
+    -1))
+
+(defn regression? [status :i64 action :i64] :i64
+  (if (and (= status 1) (= action 3)) 1 0))
+
+;; --- priority（mihari の規則） ---------------------------------------------
+;; fatal → high。error → user-count ≥ 10 か event-count ≥ 100 で high、それ以外 medium。
+;; warning → user-count ≥ 10 で medium、それ以外 low。info / debug → low。
+
+(defn- valid-level [l :i64] :i64
+  (if (and (>= l 0) (<= l 4)) 1 0))
+
+(defn priority [level :i64 event-count :i64 user-count :i64] :i64
+  (if (and (= (valid-level level) 1) (>= event-count 0) (>= user-count 0))
+    (if (= level 4)
+      2
+      (if (= level 3)
+        (if (or (>= user-count 10) (>= event-count 100)) 2 1)
+        (if (= level 2)
+          (if (>= user-count 10) 1 0)
+          0)))
+    -1))
+
+(defn level-at-least? [level :i64 floor-level :i64] :i64
+  (if (= (+ (valid-level level) (valid-level floor-level)) 2)
+    (if (>= level floor-level) 1 0)
+    0))
+
+(defn max-level [a :i64 b :i64] :i64
+  (if (= (+ (valid-level a) (valid-level b)) 2)
+    (if (>= a b) a b)
+    -1))
+
+;; --- サンプリング: hash の非負の余り（mod 1,000,000）が rate-ppm 未満なら 1 ---
+
+(defn sampled? [hash :i64 rate-ppm :i64] :i64
+  (let [rate (if (< rate-ppm 0) 0 (if (> rate-ppm 1000000) 1000000 rate-ppm))]
+    (if (< (floor-mod hash 1000000) rate) 1 0)))
+
+;; --- tests（戻り 1 = pass。行は test/fixtures/parity.edn と同じ） ------------
+
+(defn test-fingerprint [] :i64
+  (if (and (= (fingerprint []) 7)
+           (= (fingerprint [97]) 314)
+           (= (fingerprint [97 98]) 9832)
+           (= (fingerprint [84 121 112 101 69 114 114 111 114]) 1123801053)
+           (= (fingerprint [84 121 112 101 69 114 114 111 114 58 32 120 32 105 115
+                            32 117 110 100 101 102 105 110 101 100])
+              2137996913)
+           (= (fingerprint [35211 24373 12426]) 34814297)
+           (= (fingerprint [55357 56832]) 1779626))
+    1 0))
+
+(defn test-fingerprint-sum [] :i64
+  ;; 7 行の期待値の和。どれか 1 行だけずれても気づく別経路。
+  (if (= (+ (fingerprint []) (fingerprint [97]) (fingerprint [97 98])
+            (fingerprint [35211 24373 12426]) (fingerprint [55357 56832]))
+         (+ 7 314 9832 34814297 1779626))
+    1 0))
+
+(defn test-next-status [] :i64
+  (if (and (= (next-status 0 1) 1)
+           (= (next-status 0 2) 2)
+           (= (next-status 1 0) 0)
+           (= (next-status 1 3) 0)
+           (= (next-status 0 3) 0)
+           (= (next-status 2 3) 2)
+           (= (next-status 2 0) 0)
+           (= (next-status 3 1) -1)
+           (= (next-status 0 4) -1)
+           (= (next-status -1 0) -1))
+    1 0))
+
+(defn test-regression [] :i64
+  (if (and (= (regression? 1 3) 1)
+           (= (regression? 0 3) 0)
+           (= (regression? 2 3) 0)
+           (= (regression? 1 1) 0))
+    1 0))
+
+(defn test-priority [] :i64
+  (if (and (= (priority 4 1 0) 2)
+           (= (priority 3 1 0) 1)
+           (= (priority 3 1 10) 2)
+           (= (priority 3 100 0) 2)
+           (= (priority 3 99 9) 1)
+           (= (priority 2 1 10) 1)
+           (= (priority 2 1 9) 0)
+           (= (priority 1 500 500) 0)
+           (= (priority 0 1 1) 0)
+           (= (priority 5 1 1) -1)
+           (= (priority 3 -1 0) -1))
+    1 0))
+
+(defn test-level-at-least [] :i64
+  (if (and (= (level-at-least? 3 2) 1)
+           (= (level-at-least? 2 3) 0)
+           (= (level-at-least? 4 4) 1)
+           (= (level-at-least? 5 0) 0))
+    1 0))
+
+(defn test-sampled [] :i64
+  (if (and (= (sampled? 123456789 1000000) 1)
+           (= (sampled? 123456789 0) 0)
+           (= (sampled? 123456789 456790) 1)
+           (= (sampled? 123456789 456789) 0)
+           (= (sampled? -1 1000000) 1)
+           (= (sampled? -1 999999) 0)
+           (= (sampled? 5 2000000) 1)
+           (= (sampled? 5 -3) 0))
+    1 0))
+
+(defn test-max-level [] :i64
+  (if (and (= (max-level 2 3) 3)
+           (= (max-level 4 0) 4)
+           (= (max-level 7 1) -1))
+    1 0))

@@ -1,0 +1,16 @@
+{
+  "name": "app-itonami-mihari",
+  "version": "0.1.0",
+  "private": true,
+  "description": "mihari — Sentry 互換のエラー見張り（itonami dapp）",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "test": "kbb --backend sci --classpath src:test:../../kotoba-lang/text/src test/run_tests.cljk",
+    "check:guest": "../../kotoba-lang/amu/bin/amu check aiueos/mihari_core.cljk",
+    "test:guest": "../../kotoba-lang/amu/bin/amu test aiueos/mihari_core.cljk",
+    "build:guest": "../../kotoba-lang/amu/bin/amu compile aiueos/mihari_core.cljk --target wasm32-browser --output aiueos/mihari_core.wasm",
+    "test:wasm": "node test/guest_parity.mjs",
+    "test:all": "npm run test && npm run test:guest && npm run test:wasm",
+    "preview": "K=${KOTOBA_LANG:-../../kotoba-lang}; kbb --backend sci --classpath \"src:site:$K/html/src:$K/css/src:$K/jp-go-digital-design-system/src:$K/text/src\" scripts/preview.cljk"
+  }
+}

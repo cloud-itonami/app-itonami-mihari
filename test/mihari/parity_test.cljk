@@ -1,0 +1,34 @@
+(ns mihari.parity-test
+  "parity fixture — test/fixtures/parity.edn の全行を adapter（mihari.core）で
+  照合する。同じ表を guest の test-*（amu test、3 ターゲット）と wasm 産物
+  （test/guest_parity.mjs）も通す。"
+  (:require ["fs" :as fs]
+            [cljs.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            [mihari.core :as core]))
+
+(def rows (edn/read-string (fs/readFileSync "test/fixtures/parity.edn" "utf8")))
+
+(def fns {"fingerprint" core/fingerprint
+          "next-status" core/next-status
+          "regression?" core/regression?
+          "priority" core/priority
+          "level-at-least?" core/level-at-least?
+          "sampled?" core/sampled?
+          "max-level" core/max-level})
+
+(deftest table-is-not-empty
+  (is (= 47 (count rows)) "行を足したら guest の test-* と docstring の件数も直す"))
+
+(deftest every-row-matches
+  (doseq [{f :fn args :args expect :expect note :note} rows]
+    (testing (str f " " (pr-str args) (when (seq note) (str " (" note ")")))
+      (is (contains? fns f))
+      (is (= expect (apply (get fns f) args))))))
+
+(deftest strings-bridge-to-the-same-codes
+  (testing "文字列 → UTF-16 code unit が表の行と同じ数になる"
+    (is (= 9832 (core/fingerprint-str "ab")))
+    (is (= 1123801053 (core/fingerprint-str "TypeError")))
+    (is (= 34814297 (core/fingerprint-str "見張り")))
+    (is (= 1779626 (core/fingerprint-str "😀")))))

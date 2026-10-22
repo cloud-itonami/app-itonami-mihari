@@ -1,0 +1,25 @@
+;; mihari エラー見張り dapp — aiueos アプリ記述子（形は kotoba-lang/aiueos の
+;; examples/apps/notes.edn、参照実装 cloud-itonami/kaikei の aiueos/kaikei.edn に準拠）。
+;; 実装の正本: mihari_core.cljk / docs/aiueos-dapp.md。
+;;
+;; 判断コア guest（:effects #{}）を指す。imports は無し —— fingerprint / status 遷移 /
+;; priority / sampling は計算だけで、取り込み・保存・描画はこの外の層（src/、site/）が持つ。
+;; aiueos session/grant への配線は未実装（docs/aiueos-dapp.md の未実装境界を参照）。
+{:aiueos/component :app/mihari
+ :aiueos/kind :app
+ :aiueos/trust :untrusted
+ :aiueos/source "mihari_core.cljk"
+ :aiueos/wasm "mihari_core.wasm"
+ :aiueos/entry "main"
+ :aiueos/args []
+ :aiueos/imports #{}
+ :aiueos/exports #{:app/main
+                   :app/fingerprint
+                   :app/next-status
+                   :app/regression?
+                   :app/priority
+                   :app/level-at-least?
+                   :app/sampled?
+                   :app/max-level}
+ :aiueos/effects #{}
+ :aiueos/limits {:memory-pages 16 :fuel 5000000}}

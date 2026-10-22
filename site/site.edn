@@ -1,0 +1,15 @@
+;; app.itonami.cloud/mihari/ の公開物の宣言（契約: Linear JUN-286 の SPEC §4）。
+;; 生成器（network-awai/cloud-itonami の scripts）がこの 1 ファイルを読んで、
+;; vendor と sources を :to へコピーし、(mihari.page/document opts) を呼ぶ。
+;; scripts/preview.cljk も同じ宣言からローカルの確認用ページを組む。
+{:title "mihari — Sentry 互換のエラー見張り"
+ :description "Sentry の envelope／event JSON を取り込み、issue にまとめてトリアージし、Sentry と同じ形で書き出す。ブラウザの中だけで動き、入力は送信されない（外部リクエストはゼロ）。"
+ :page {:ns mihari.page :fn document}
+ :vendor ["react.production.min.js" "react-dom.production.min.js"
+          "scittle.js" "scittle.reagent.js" "scittle.re-frame.js"]
+ :external [{:repo "kotoba-lang/text" :from "src/kotoba/lang/text.cljk" :to "kotoba/lang/text.cljs"}]
+ :sources [{:from "src/mihari/core.cljk" :to "mihari/core.cljs"}
+           {:from "src/mihari/ingest.cljk" :to "mihari/ingest.cljs"}
+           {:from "src/mihari/export.cljk" :to "mihari/export.cljs"}
+           {:from "src/mihari/view.cljk" :to "mihari/view.cljs"}
+           {:from "site/app.cljk" :to "app.cljs"}]}

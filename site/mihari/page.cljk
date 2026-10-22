@@ -1,0 +1,68 @@
+(ns mihari.page
+  "app.itonami.cloud/mihari/ の殻（SSR）。生成器（network-awai/cloud-itonami の
+  scripts）が `(document opts)` を呼び、返った HTML に cloud-itonami 共通の
+  クロームを被せる。契約は site/site.edn と SPEC（JUN-286）の §4。
+
+  opts:
+    :css             DADS の dds.css（生成器が読んで渡す。inline する）
+    :vendor-scripts  [\"vendor/react.production.min.js\" …]（site.edn の :vendor 順）
+    :scittle-scripts [\"kotoba/lang/text.cljs\" … \"app.cljs\"]（site.edn の順）
+
+  本文は `mihari.view/main` の初期状態を SSR したもの。JS が無くても何の道具か、
+  データが送信されないこと、JS が要ることが読める。ブラウザでは Reagent が
+  同じ view を #app に描き直す。
+
+  外部リクエストはゼロ: CSS は inline、スクリプトはすべて同一オリジンの相対参照。"
+  (:require [jp-go-dds.page :as dds-page]
+            [mihari.view :as view]))
+
+(def site-title "mihari — Sentry 互換のエラー見張り")
+
+(def site-description
+  "Sentry の envelope／event JSON を取り込み、issue にまとめてトリアージし、Sentry と同じ形で書き出す。ブラウザの中だけで動き、入力は送信されない。")
+
+(def app-css
+  ".mihari{padding-block:24px 48px}
+.mihari-header{margin-block-end:16px}
+.mihari-lead,.mihari-help{max-width:72ch;line-height:1.7}
+.mihari-panel{margin-block:24px}
+.mihari-row{gap:12px;align-items:flex-end;flex-wrap:wrap;margin-block:12px}
+.mihari-filters>*{min-width:12rem}
+.mihari-table{overflow-x:auto}
+.mihari-issue-link{all:unset;cursor:pointer;display:flex;gap:8px;align-items:baseline}
+.mihari-issue-link:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+.mihari-short-id{font-family:ui-monospace,monospace;font-size:.85em;opacity:.75}
+.mihari-title{font-weight:600}
+.mihari-culprit{display:block;font-size:.85em;opacity:.75;font-family:ui-monospace,monospace}
+.mihari-selected{outline:2px solid var(--color-primitive-blue-900,#0031d8);outline-offset:-2px}
+.mihari-num{text-align:right;font-variant-numeric:tabular-nums}
+.mihari-time{white-space:nowrap;font-variant-numeric:tabular-nums}
+.mihari-notice{padding:8px 12px;border-left:4px solid var(--color-primitive-blue-900,#0031d8)}
+.mihari-notice[data-tone=error]{border-left-color:var(--color-primitive-red-900,#c00)}
+.mihari-facts{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}
+.mihari-facts dt{font-weight:600}
+.mihari-confirm{display:inline-flex;gap:8px;align-items:center}
+.mihari-footer{margin-block-start:48px;font-size:.85em;opacity:.8;max-width:72ch}
+.mihari-empty{opacity:.8}")
+
+(defn- strip-client-only
+  "SSR では React の :key と handler（fn）は意味を持たないので外す。"
+  [form]
+  (cond
+    (map? form) (into {} (remove (fn [[k v]] (or (= k :key) (fn? v)))) form)
+    (vector? form) (mapv strip-client-only form)
+    (seq? form) (map strip-client-only form)
+    :else form))
+
+(defn document [{:keys [css vendor-scripts scittle-scripts]}]
+  (dds-page/->page
+   {:title site-title
+    :description site-description
+    :css (or css "")
+    :app-css app-css}
+   [:noscript
+    [:p {:class "mihari-notice" :data-tone "error"}
+     "mihari はブラウザの JavaScript で動きます（取り込み・保存・書き出しはすべてこのブラウザの中）。JavaScript を有効にしてください。"]]
+   [:div {:id "app"} (strip-client-only (view/main view/initial-model {}))]
+   (for [src vendor-scripts] [:script {:src (str "./" src)}])
+   (for [src scittle-scripts] [:script {:type "application/x-scittle" :src (str "./" src)}])))

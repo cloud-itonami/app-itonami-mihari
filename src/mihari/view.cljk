@@ -1,0 +1,258 @@
+(ns mihari.view
+  "mihari の画面 — 純粋な hiccup（データ → hiccup）。
+
+  同じ関数を 2 か所で使う:
+  - SSR（site/mihari/page.cljk）: `(main model {})` を HTML にして初期表示に置く。
+    handler が無いので操作部品は出るが反応しない（JS が無い状態の正直な姿）。
+  - ブラウザ（site/app.cljk）: Reagent がこの hiccup を描き、handler は re-frame
+    の dispatch を呼ぶ。
+
+  React に渡すので hiccup は React 安全に書く: `:style` は map、イベントは fn、
+  `:class` は文字列。部品の class は DADS（デジタル庁デザインシステム）の
+  markup に合わせてある（CSS はページが inline する）。"
+  (:require [kotoba.lang.text :as text]
+            [mihari.core :as core]))
+
+(def ^:private level-color {"fatal" "magenta" "error" "red" "warning" "yellow" "info" "blue" "debug" "gray"})
+(def ^:private priority-color {"high" "red" "medium" "orange" "low" "gray"})
+(def ^:private status-label {"unresolved" "未解決 unresolved" "resolved" "解決 resolved" "ignored" "無視 ignored"})
+
+(defn- chip [label color]
+  [:span {:class "dads-chip-label" :data-style "text" :data-color color} label])
+
+(defn- button
+  ([label on-click] (button label on-click {}))
+  ([label on-click {:keys [type size disabled aria-label]
+                    :or {type "solid-fill" size "sm"}}]
+   [:button (cond-> {:class "dads-button" :data-type type :data-size size :type "button"}
+              on-click (assoc :on-click on-click)
+              disabled (assoc :disabled true)
+              aria-label (assoc :aria-label aria-label))
+    label]))
+
+(defn- target-value [e] (.. e -target -value))
+
+(defn- select-field
+  "DADS select。h がある（ブラウザ）なら controlled な :value、無い（SSR）なら
+  option の :selected で現在値を出す。"
+  [{:keys [id label value on-change]} options]
+  [:div {:class "dads-form-control-label" :data-size "sm"}
+   [:label {:class "dads-form-control-label__label" :for id} label]
+   [:div
+    [:span {:class "dads-select"}
+     [:span {:class "dads-select__control"}
+      (into [:select (cond-> {:class "dads-select__select" :data-size "sm" :id id}
+                       on-change (assoc :value (str value)
+                                        :on-change (fn [e] (on-change (target-value e)))))]
+            (map (fn [[v l]]
+                   [:option (cond-> {:value v :key v}
+                              (and (nil? on-change) (= (str v) (str value))) (assoc :selected true))
+                    l])
+                 options))
+      [:svg {:class "dads-select__chevron" :width 16 :height 16 :viewBox "0 0 24 24" :aria-hidden "true"}
+       [:path {:d "M12 17L3 8L4 7L12 15L20 7L21 8L12 17Z" :fill "currentcolor"}]]]]]])
+
+(defn- text-field [{:keys [id label value on-change placeholder type]}]
+  [:div {:class "dads-form-control-label" :data-size "sm"}
+   [:label {:class "dads-form-control-label__label" :for id} label]
+   [:div
+    [:span {:class "dads-input-text"}
+     [:input (cond-> {:class "dads-input-text__input" :data-size "sm" :id id :type (or type "text")}
+               placeholder (assoc :placeholder placeholder)
+               on-change (assoc :value (or value "")
+                                :on-change (fn [e] (on-change (target-value e)))))]]]])
+
+;; ───────── 取り込み ─────────
+
+(defn- import-report [{:keys [report error]}]
+  (cond
+    error [:p {:class "mihari-notice" :data-tone "error" :role "status"} error]
+    report [:p {:class "mihari-notice" :role "status"}
+            (str (:added report) " 件の event を取り込みました（形式: " (name (or (:format report) :unknown))
+                 (when (pos? (:duplicates report 0)) (str "、既知の event " (:duplicates report) " 件は無視"))
+                 (when (seq (:skipped report))
+                   (str "、取り込まなかった item: "
+                        (text/join "、" (map (fn [[k n]] (str k " " n)) (sort (:skipped report))))))
+                 "）")]
+    :else nil))
+
+(defn import-panel [{:keys [import]} h]
+  [:section {:class "dds-ext-section mihari-panel" :aria-labelledby "mihari-import-title"}
+   [:h2 {:class "dads-heading" :data-size "20" :id "mihari-import-title"} "取り込む"]
+   [:p {:class "mihari-help"}
+    "Sentry SDK の envelope（"
+    [:code "/api/{project}/envelope/"]
+    " に送られる形）、event の JSON（1 件または配列）、Sentry API の "
+    [:code "/events/"]
+    " の応答を貼り付けるか、ファイルを選んでください。IP アドレス・request header・cookie・email は取り込む時点で捨てます。"]
+   [:div {:class "dads-form-control-label" :data-size "sm"}
+    [:label {:class "dads-form-control-label__label" :for "mihari-import-text"} "貼り付け"]
+    [:div
+     [:span {:class "dads-textarea"}
+      [:textarea (cond-> {:class "dads-textarea__textarea" :id "mihari-import-text" :rows 6
+                          :spell-check false
+                          :placeholder "{\"event_id\":\"…\",\"level\":\"error\",\"exception\":{…}}"}
+                   (:on-import-text h) (assoc :value (or (:text import) "")
+                                              :on-change (fn [e] ((:on-import-text h) (target-value e)))))]]]]
+   [:div {:class "dds-ext-row mihari-row"}
+    (text-field {:id "mihari-import-project" :label "project（省略時は DSN か event の値）"
+                 :value (:project import) :placeholder "web"
+                 :on-change (:on-import-project h)})
+    [:div {:class "dads-form-control-label" :data-size "sm"}
+     [:label {:class "dads-form-control-label__label" :for "mihari-import-file"} "ファイル"]
+     [:div
+      [:input (cond-> {:id "mihari-import-file" :type "file" :class "mihari-file"
+                       :accept ".json,.envelope,.txt,application/json,application/x-sentry-envelope"}
+                (:on-import-file h) (assoc :on-change (fn [e]
+                                                        (let [f (aget (.. e -target -files) 0)]
+                                                          (when f ((:on-import-file h) f))
+                                                          (set! (.. e -target -value) "")))))]]]]
+   [:div {:class "dds-ext-row mihari-row"}
+    (button "取り込む" (:on-import h) {:disabled (and (:on-import h) (text/blank? (:text import)))})
+    (button "サンプルを読み込む" (:on-sample h) {:type "outline"})]
+   (import-report import)])
+
+;; ───────── 一覧 ─────────
+
+(defn- filters-row [{:keys [filters db]} h]
+  [:div {:class "dds-ext-row mihari-row mihari-filters"}
+   (select-field {:id "mihari-f-project" :label "project" :value (or (:project filters) "all")
+                  :on-change (when-let [f (:on-filter h)] #(f :project %))}
+                 (into [["all" "すべて"]] (map (fn [p] [p p]) (core/projects db))))
+   (select-field {:id "mihari-f-status" :label "status" :value (or (:status filters) "unresolved")
+                  :on-change (when-let [f (:on-filter h)] #(f :status %))}
+                 [["all" "すべて"] ["unresolved" "未解決"] ["resolved" "解決"] ["ignored" "無視"]])
+   (select-field {:id "mihari-f-level" :label "level 以上" :value (or (:min-level filters) "debug")
+                  :on-change (when-let [f (:on-filter h)] #(f :min-level %))}
+                 (map (fn [l] [l l]) core/levels))
+   (text-field {:id "mihari-f-query" :label "検索" :type "search" :value (:query filters)
+                :placeholder "title / culprit / shortId"
+                :on-change (when-let [f (:on-filter h)] #(f :query %))})])
+
+(defn- issue-row [issue selected? h]
+  [:tr (cond-> {:key (:id issue) :class (if selected? "mihari-selected" "")}
+         selected? (assoc :aria-selected "true"))
+   [:td
+    [:button {:type "button" :class "mihari-issue-link"
+              :on-click (when-let [f (:on-select h)] #(f (:id issue)))}
+     [:span {:class "mihari-short-id"} (:short-id issue)]
+     [:span {:class "mihari-title"} (:title issue)]]
+    (when (:culprit issue) [:span {:class "mihari-culprit"} (:culprit issue)])
+    (when (:regressed? issue) (chip "regressed" "purple"))]
+   [:td (chip (:level issue) (level-color (:level issue) "gray"))]
+   [:td (chip (:priority issue) (priority-color (:priority issue) "gray"))]
+   [:td (status-label (:status issue) (:status issue))]
+   [:td {:class "mihari-num"} (str (:count issue))]
+   [:td {:class "mihari-num"} (str (core/user-count issue))]
+   [:td {:class "mihari-time"} (or (:last-seen issue) "—")]])
+
+(defn issue-table [{:keys [db filters selected]} h]
+  (let [issues (core/issue-list db (merge {:status "unresolved"} filters))]
+    [:section {:class "dds-ext-section mihari-panel" :aria-labelledby "mihari-issues-title"}
+     [:h2 {:class "dads-heading" :data-size "20" :id "mihari-issues-title"}
+      (str "Issues（" (count issues) " / " (count (:issues db)) "）")]
+     (filters-row {:filters filters :db db} h)
+     (if (empty? issues)
+       [:p {:class "mihari-empty"}
+        (if (empty? (:issues db))
+          "まだ何もありません。上の「取り込む」から event を入れてください。"
+          "条件に合う issue はありません。")]
+       [:div {:class "dads-table mihari-table"}
+        [:table {:class "dads-table__table"}
+         [:thead
+          [:tr
+           [:th {:class "dads-table__col-header" :scope "col"} "Issue"]
+           [:th {:class "dads-table__col-header" :scope "col"} "level"]
+           [:th {:class "dads-table__col-header" :scope "col"} "priority"]
+           [:th {:class "dads-table__col-header" :scope "col"} "status"]
+           [:th {:class "dads-table__col-header" :scope "col"} "events"]
+           [:th {:class "dads-table__col-header" :scope "col"} "users"]
+           [:th {:class "dads-table__col-header" :scope "col"} "last seen"]]]
+         (into [:tbody] (map #(issue-row % (= selected (:id %)) h) issues))]])]))
+
+;; ───────── 詳細 ─────────
+
+(defn issue-detail [{:keys [db selected]} h]
+  (when-let [issue (get-in db [:issues selected])]
+    (let [events (core/issue-events db selected)
+          act (fn [k] (when-let [f (:on-status h)] #(f selected k)))]
+      [:section {:class "dds-ext-section mihari-panel mihari-detail" :aria-labelledby "mihari-detail-title"}
+       [:h2 {:class "dads-heading" :data-size "20" :id "mihari-detail-title"}
+        (str (:short-id issue) " — " (:title issue))]
+       [:dl {:class "mihari-facts"}
+        [:dt "status"] [:dd (status-label (:status issue)) (when (:regressed? issue) " （regression）")]
+        [:dt "level / priority"] [:dd (:level issue) " / " (:priority issue)]
+        [:dt "culprit"] [:dd (or (:culprit issue) "—")]
+        [:dt "events / users"] [:dd (str (:count issue) " / " (core/user-count issue))]
+        [:dt "first / last seen"] [:dd (str (or (:first-seen issue) "—") " → " (or (:last-seen issue) "—"))]
+        [:dt "release"] [:dd (str (or (:release-first issue) "—") " → " (or (:release-last issue) "—"))]]
+       [:div {:class "dds-ext-row mihari-row"}
+        (button "解決 Resolve" (act :resolve) {:disabled (= "resolved" (:status issue))})
+        (button "無視 Ignore" (act :ignore) {:type "outline" :disabled (= "ignored" (:status issue))})
+        (button "未解決に戻す Unresolve" (act :unresolve) {:type "outline" :disabled (= "unresolved" (:status issue))})
+        (button "この issue の events を書き出す" (when-let [f (:on-export h)] #(f :events)) {:type "text"})
+        (button "閉じる" (when-let [f (:on-select h)] #(f nil)) {:type "text"})]
+       [:div {:class "dads-table mihari-table"}
+        [:table {:class "dads-table__table"}
+         [:caption (str "Events（" (count events) "）")]
+         [:thead
+          [:tr
+           [:th {:class "dads-table__col-header" :scope "col"} "time"]
+           [:th {:class "dads-table__col-header" :scope "col"} "level"]
+           [:th {:class "dads-table__col-header" :scope "col"} "message"]
+           [:th {:class "dads-table__col-header" :scope "col"} "release / env"]
+           [:th {:class "dads-table__col-header" :scope "col"} "event id"]]]
+         (into [:tbody]
+               (map (fn [e]
+                      [:tr {:key (:event-id e)}
+                       [:td {:class "mihari-time"} (or (:timestamp e) "—")]
+                       [:td (chip (:level e) (level-color (:level e) "gray"))]
+                       [:td (or (:message e) (:exception-value e) (:title e))]
+                       [:td (str (or (:release e) "—") " / " (or (:environment e) "—"))]
+                       [:td [:code (:event-id e)]]])
+                    events))]]])))
+
+;; ───────── 書き出し・消去 ─────────
+
+(defn data-panel [{:keys [db confirm-clear?]} h]
+  [:section {:class "dds-ext-section mihari-panel" :aria-labelledby "mihari-data-title"}
+   [:h2 {:class "dads-heading" :data-size "20" :id "mihari-data-title"} "書き出し・消去"]
+   [:p {:class "mihari-help"}
+    "issue 一覧は Sentry API（" [:code "/api/0/projects/{org}/{project}/issues/"]
+    "）と同じキーの JSON で、event は取り込み直せる envelope で書き出します。"
+    "データはこのブラウザの localStorage にだけあり、どこにも送信されません。"]
+   [:div {:class "dds-ext-row mihari-row"}
+    (button "issues.json" (when-let [f (:on-export h)] #(f :issues)) {:type "outline" :disabled (empty? (:issues db))})
+    (button "events.envelope" (when-let [f (:on-export h)] #(f :envelope)) {:type "outline" :disabled (empty? (:issues db))})
+    (if confirm-clear?
+      [:span {:class "mihari-confirm"}
+       "すべての issue と event を消去します。"
+       (button "消去する" (:on-clear h) {:size "sm"})
+       (button "やめる" (:on-clear-cancel h) {:type "text"})]
+      (button "すべて消去" (:on-clear-ask h) {:type "text" :disabled (empty? (:issues db))}))]])
+
+(defn main
+  "画面全体。model: {:db :filters :selected :import :confirm-clear?}。
+  h: handler の map（SSR では {}）。"
+  [model h]
+  [:div {:class "dds-ext-container mihari"}
+   [:header {:class "mihari-header"}
+    [:h1 {:class "dads-heading" :data-size "32"} "mihari — Sentry 互換のエラー見張り"]
+    [:p {:class "mihari-lead"}
+     "Sentry の envelope や event JSON を取り込み、issue にまとめ、トリアージして、Sentry と同じ形で書き出す道具です。"
+     "すべてこのブラウザの中で動き、入力は送信されません（外部リクエストはゼロ）。"]]
+   (import-panel model h)
+   (issue-table model h)
+   (issue-detail model h)
+   (data-panel model h)
+   [:footer {:class "mihari-footer"}
+    [:p "Sentry は Functional Software, Inc. の商標です。mihari はデータ形式の互換を名乗るだけで、同社との提携や同一性を主張しません。"
+     "priority の決め方とグルーピングは mihari 独自の規則で、Sentry 本家のアルゴリズムの再現ではありません。"]
+    [:p "source: cloud-itonami/app-itonami-mihari（AGPL-3.0-or-later）。判断コアは aiueos guest（aiueos/mihari_core.cljk）と同じ表で照合しています。"]]])
+
+(def initial-model
+  {:db core/empty-db
+   :filters {:project "all" :status "unresolved" :min-level "debug" :query ""}
+   :selected nil
+   :import {:text "" :project "" :report nil :error nil}
+   :confirm-clear? false})
