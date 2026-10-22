@@ -7,7 +7,8 @@
  :page {:ns mihari.page :fn document}
  :vendor ["react.production.min.js" "react-dom.production.min.js"
           "scittle.js" "scittle.reagent.js" "scittle.re-frame.js"]
- :external [{:repo "kotoba-lang/text" :from "src/kotoba/lang/text.cljk" :to "kotoba/lang/text.cljs"}]
+ :external [{:repo "kotoba-lang/text" :sha "bc551a3ecc68e551ba1dd2fcb22d5f1b8dd7805d"
+             :from "src/kotoba/lang/text.cljk" :to "kotoba/lang/text.cljs"}]
  :sources [{:from "src/mihari/core.cljk" :to "mihari/core.cljs"}
            {:from "src/mihari/ingest.cljk" :to "mihari/ingest.cljs"}
            {:from "src/mihari/export.cljk" :to "mihari/export.cljs"}
