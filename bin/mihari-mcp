@@ -13,18 +13,43 @@
 ;; tool の中身は src/mihari/mcp.cljk（純関数）。ネットワーク・ファイル書き込み・
 ;; 状態保存はしない。
 ;;
-;; 任意の cwd から `kbb /abs/path/bin/mihari-mcp` で起動できる: kbb はこの
-;; ファイルの位置から nbb.edn（repo root）を見つけ、kotoba-lang/text を pin
-;; （bc551a3）どおり gitlibs から解決する。src/ は念のためここでも足す。
+;; ## 依存は repo の nbb.edn の pin から取る
+;;
+;; kbb の既定 classpath は west の兄弟 checkout（`kotoba-lang/text/src`）を含み、
+;; `add-classpath` は末尾に足すだけなので、手元の checkout が作業中のブランチに
+;; あればそちらが勝つ（実測 2026-10-22: cwd `/` の `kbb -Spath` の 2 番目が
+;; `~/github/kotoba-lang/text/src`）。kbb は cwd の nbb.edn の :deps
+;; （kotoba-lang/text の固定 sha）を先に置くので、cwd がこの repo でなければ、
+;; repo を cwd にして自分を起動し直す。stdin / stdout はそのまま子に渡す。
+;; dandori の bin/dandori-mcp と同じ方式。
 (ns mihari-mcp
-  (:require ["node:path" :as path]
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
             ["node:readline" :as readline]
-            [nbb.classpath :as classpath]
             [nbb.core :refer [*file*]]))
 
-(def repo-directory (path/resolve (path/dirname *file*) ".."))
+(def repo-directory
+  (fs/realpathSync (path/resolve (path/dirname *file*) "..")))
 
-(classpath/add-classpath (path/resolve repo-directory "src"))
+(def ^:private reexec-env "MIHARI_MCP_REEXEC")
+
+(defn- cwd-is-repo? []
+  (= (fs/realpathSync (js/process.cwd)) repo-directory))
+
+(when-not (cwd-is-repo?)
+  (if (aget js/process.env reexec-env)
+    (do (.write js/process.stderr "mihari-mcp: cwd is not the repository after re-exec\n")
+        (js/process.exit 70))
+    (let [r (cp/spawnSync "kbb" #js [(path/join repo-directory "bin" "mihari-mcp")]
+                          #js {:cwd repo-directory
+                               :stdio "inherit"
+                               :env (js/Object.assign #js {} js/process.env
+                                                      (clj->js {reexec-env "1"}))})]
+      (when-let [e (.-error r)]
+        (.write js/process.stderr (str "mihari-mcp: could not start kbb: " (.-message e) "\n")))
+      (js/process.exit (if (number? (.-status r)) (.-status r) 1)))))
+
 (require '[mihari.mcp :as mcp])
 
 (defn- write-line! [s]
