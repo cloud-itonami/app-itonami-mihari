@@ -13,4 +13,4 @@
          :extra-deps {io.github.kotoba-lang/jp-go-dds
                       {:local/root "../../kotoba-lang/jp-go-digital-design-system"}
                       io.github.kotoba-lang/html
-                      {:local/root "../../kotoba-lang/html"}}}}}
+        {:local/root "../../kotoba-lang/kotoba/lib/kotoba.html"}}}}}
