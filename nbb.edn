@@ -1,4 +1,6 @@
 ;; nbb.edn -- kbb は git deps を deps.edn ではなくここから読む（rirekisho と同じ注記）。
 {:paths ["src"]
- :deps {io.github.kotoba-lang/text {:git/url "https://github.com/kotoba-lang/text.git"
-                                    :git/sha "bc551a3ecc68e551ba1dd2fcb22d5f1b8dd7805d"}}}
+ :deps {io.github.kotoba-lang/text
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "ee440887baf7dfdfc41b84f0f07af31b05ee6b1a"
+         :deps/root "lib/kotoba.text"}}}
